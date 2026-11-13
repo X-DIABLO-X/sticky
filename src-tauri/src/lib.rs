@@ -52,6 +52,28 @@ pub struct AppState {
 }
 
 pub fn run() {
+    if let Some(h) = dirs::home_dir() {
+        let dir = h.join(".heyclicky");
+        let _ = std::fs::create_dir_all(&dir);
+        let log_path = dir.join("app.log");
+        let _ = std::fs::write(&log_path, format!("[{}] Starting HeyClicky...\n", chrono::Local::now()));
+    }
+
+    std::panic::set_hook(Box::new(|info| {
+        let crash_path = dirs::home_dir().unwrap_or_default().join(".heyclicky").join("crash.log");
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "Unknown panic".to_string()
+        };
+        let location = info.location().map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column())).unwrap_or_default();
+        let msg = format!("[{}] CRASH PANIC: {}\nLocation: {}\n", chrono::Local::now(), payload, location);
+        let _ = std::fs::write(&crash_path, &msg);
+        eprintln!("{}", msg);
+    }));
+
     let config = AppConfig::load().unwrap_or_default();
     let hotkey_config = config.hotkeys.clone();
 
@@ -64,10 +86,20 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(shortcut_builder)
         .setup(|app| {
+            let log = |m: &str| {
+                let p = dirs::home_dir().unwrap_or_default().join(".heyclicky").join("app.log");
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+                    use std::io::Write;
+                    let _ = writeln!(f, "[{}] {}", chrono::Local::now(), m);
+                }
+            };
+
+            log("Setup: loading config");
             let handle = app.handle().clone();
             let config = AppConfig::load().unwrap_or_default();
 
             // Initialize SQLite
+            log("Setup: opening SQLite database");
             let db = Database::open(&config.db_path)
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
 
@@ -75,19 +107,23 @@ pub fn run() {
             let agents_repo = Arc::new(AgentsRepository::new(db.clone()));
 
             // Initialize Audio Engine
+            log("Setup: initializing audio engine");
             let mut audio_engine = AudioEngine::new(config.groq_api_key.clone());
             let _ = audio_engine.init_output();
             let audio_engine_arc = Arc::new(Mutex::new(audio_engine));
 
             // Initialize Prewarmer
+            log("Setup: starting prewarmer");
             let prewarmer = ContextPrewarmer::new();
             prewarmer.start();
 
             // Initialize 60Hz OS Cursor Tracker for companion overlay
+            log("Setup: starting cursor tracker");
             let cursor_tracker = crate::screen::cursor::CursorTracker::new();
             cursor_tracker.start(handle.clone());
 
             // Initialize AI Router & Tools
+            log("Setup: initializing router and tools");
             let router = Arc::new(ModelRouter::new(config.clone()));
             let mut tool_registry = ToolRegistry::new();
             register_os_tools(&mut tool_registry);
@@ -103,6 +139,7 @@ pub fn run() {
             });
 
             // Initialize Feature Controllers
+            log("Setup: initializing feature controllers");
             let talk_controller = Arc::new(TalkController::new(
                 handle.clone(),
                 Arc::clone(&audio_engine_arc),
@@ -126,12 +163,13 @@ pub fn run() {
             });
 
             // Set up System Tray
+            log("Setup: setting up system tray");
             let toggle_dash = MenuItem::with_id(&handle, "toggle_dashboard", "Open Dashboard Window", true, None::<&str>)?;
             let toggle_item = MenuItem::with_id(&handle, "toggle_pill", "Show / Hide Pill", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(&handle, "quit", "Quit HeyClicky", true, None::<&str>)?;
             let tray_menu = Menu::with_items(&handle, &[&toggle_dash, &toggle_item, &quit_item])?;
 
-            let _tray = TrayIconBuilder::new()
+            let mut tray_builder = TrayIconBuilder::new()
                 .menu(&tray_menu)
                 .show_menu_on_left_click(true)
                 .on_menu_event(|app, event| {
@@ -147,24 +185,34 @@ pub fn run() {
                         }
                         _ => {}
                     }
-                })
-                .build(&handle)?;
+                });
+
+            if let Some(icon) = handle.default_window_icon().cloned() {
+                tray_builder = tray_builder.icon(icon);
+            }
+
+            let _ = tray_builder.build(&handle);
 
             // Setup Global Hotkeys
+            log("Setup: configuring hotkeys");
             let _ = HotkeyManager::setup_hotkeys(&handle, &config.hotkeys);
 
             // Overlay window defaults to click-through and displayed
+            log("Setup: displaying overlay window");
             let _ = WindowManager::set_ignore_cursor_events(&handle, "overlay", true);
             let _ = WindowManager::show(&handle, "overlay");
 
             // Position Pill window top center and display
+            log("Setup: positioning and displaying pill window");
             let _ = WindowManager::position_pill_top_center(&handle);
             let _ = WindowManager::show(&handle, "pill");
 
             // Ensure Dashboard Window is displayed on startup front and center
+            log("Setup: displaying dashboard window");
             let _ = WindowManager::show(&handle, "dashboard");
 
             // Store AppState
+            log("Setup: registering AppState");
             app.manage(AppState {
                 config: Arc::new(RwLock::new(config)),
                 db,
@@ -181,6 +229,7 @@ pub fn run() {
                 scheduler_service,
             });
 
+            log("Setup: complete!");
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -209,6 +258,42 @@ pub fn run() {
             commands::open_dashboard,
             commands::toggle_dashboard,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running heyclicky application");
+        .build(tauri::generate_context!())
+        .expect("error while building heyclicky application")
+        .run(|app_handle, event| {
+            match event {
+                tauri::RunEvent::ExitRequested { api, .. } => {
+                    let p = dirs::home_dir().unwrap_or_default().join(".heyclicky").join("app.log");
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+                        use std::io::Write;
+                        let _ = writeln!(f, "[{}] ExitRequested event received! Preventing exit to keep background pill & overlay running.", chrono::Local::now());
+                    }
+                    api.prevent_exit();
+                }
+                tauri::RunEvent::WindowEvent { label, event, .. } => {
+                    match event {
+                        tauri::WindowEvent::CloseRequested { api, .. } => {
+                            let p = dirs::home_dir().unwrap_or_default().join(".heyclicky").join("app.log");
+                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+                                use std::io::Write;
+                                let _ = writeln!(f, "[{}] CloseRequested for '{}' - hiding window instead of destroying", chrono::Local::now(), label);
+                            }
+                            api.prevent_close();
+                            if let Some(win) = app_handle.get_webview_window(&label) {
+                                let _ = win.hide();
+                            }
+                        }
+                        tauri::WindowEvent::Destroyed => {
+                            let p = dirs::home_dir().unwrap_or_default().join(".heyclicky").join("app.log");
+                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+                                use std::io::Write;
+                                let _ = writeln!(f, "[{}] Window '{}' was destroyed!", chrono::Local::now(), label);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        });
 }

@@ -85,7 +85,7 @@ impl LlmProvider for GroqProvider {
         let (tx, rx) = channel(100);
         let mut byte_stream = response.bytes_stream();
 
-        tokio::spawn(async move {
+        tauri::async_runtime::spawn(async move {
             let mut buffer = String::new();
 
             while let Some(chunk_res) = byte_stream.next().await {

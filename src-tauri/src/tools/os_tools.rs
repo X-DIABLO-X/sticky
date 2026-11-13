@@ -41,7 +41,7 @@ pub fn register_os_tools(registry: &mut ToolRegistry) {
                     }
                 });
 
-                let captured = tokio::task::spawn_blocking(move || {
+                let captured = tauri::async_runtime::spawn_blocking(move || {
                     ScreenCaptureService::capture(monitor_idx, crop, Some(1280))
                 }).await.unwrap_or(Err(crate::error::AppError::Screen("timeout".into())))?;
 
@@ -71,7 +71,7 @@ pub fn register_os_tools(registry: &mut ToolRegistry) {
         Arc::new(|args| {
             Box::pin(async move {
                 let max_depth = args.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(6) as usize;
-                let tree = tokio::task::spawn_blocking(move || {
+                let tree = tauri::async_runtime::spawn_blocking(move || {
                     get_focused_window_tree(max_depth)
                 }).await.unwrap_or(Err(crate::error::AppError::A11y("timeout".into())))?;
 
@@ -109,7 +109,7 @@ pub fn register_os_tools(registry: &mut ToolRegistry) {
                 let btn = args.get("button").and_then(|v| v.as_str()).unwrap_or("left").to_string();
                 let btn_clone = btn.clone();
 
-                tokio::task::spawn_blocking(move || {
+                tauri::async_runtime::spawn_blocking(move || {
                     let mut sim = InputSimulator::new()?;
                     sim.click(x, y, &btn_clone)?;
                     Ok::<(), crate::error::AppError>(())
@@ -141,7 +141,7 @@ pub fn register_os_tools(registry: &mut ToolRegistry) {
                 let enter = args.get("press_enter").and_then(|v| v.as_bool()).unwrap_or(false);
                 let text_clone = text.clone();
 
-                tokio::task::spawn_blocking(move || {
+                tauri::async_runtime::spawn_blocking(move || {
                     let mut sim = InputSimulator::new()?;
                     sim.type_text(&text_clone, enter)?;
                     Ok::<(), crate::error::AppError>(())
@@ -177,7 +177,7 @@ pub fn register_os_tools(registry: &mut ToolRegistry) {
                     .unwrap_or_default();
                 let keys_clone = keys.clone();
 
-                tokio::task::spawn_blocking(move || {
+                tauri::async_runtime::spawn_blocking(move || {
                     let mut sim = InputSimulator::new()?;
                     sim.press_hotkey(&keys_clone)?;
                     Ok::<(), crate::error::AppError>(())

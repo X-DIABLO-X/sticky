@@ -53,7 +53,7 @@ impl DriveController {
         let abort_flag = Arc::new(AtomicBool::new(false));
         let watchdog_handle = spawn_safety_watchdog(Arc::clone(&abort_flag), current_pos);
 
-        let action_res = tokio::task::spawn_blocking(move || -> Result<()> {
+        let action_res = tauri::async_runtime::spawn_blocking(move || -> Result<()> {
             let mut sim = InputSimulator::new()?;
             match action.action_type.as_str() {
                 "click" => {
@@ -94,7 +94,7 @@ impl DriveController {
         action_res?;
 
         // Re-read A11y tree to verify UI state after action
-        let new_tree = tokio::task::spawn_blocking(|| get_focused_window_tree(3))
+        let new_tree = tauri::async_runtime::spawn_blocking(|| get_focused_window_tree(3))
             .await
             .unwrap_or(Err(AppError::A11y("Verification failed".into())))?;
 

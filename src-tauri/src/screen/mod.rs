@@ -44,7 +44,7 @@ impl ContextPrewarmer {
                 interval.tick().await;
 
                 // Query active window A11y tree (depth 4 for fast prewarm)
-                if let Ok(tree) = tokio::task::spawn_blocking(|| get_focused_window_tree(4)).await.unwrap_or(Err(crate::error::AppError::A11y("timeout".into()))) {
+                if let Ok(tree) = tauri::async_runtime::spawn_blocking(|| get_focused_window_tree(4)).await.unwrap_or(Err(crate::error::AppError::A11y("timeout".into()))) {
                     let mut prev = last_title.write().await;
                     if *prev != tree.window_title {
                         *prev = tree.window_title.clone();
@@ -56,7 +56,7 @@ impl ContextPrewarmer {
                             *a11y_guard = Some(tree);
                         }
 
-                        if let Ok(screen) = tokio::task::spawn_blocking(|| ScreenCaptureService::capture(0, None, Some(1280))).await.unwrap_or(Err(crate::error::AppError::Screen("timeout".into()))) {
+                        if let Ok(screen) = tauri::async_runtime::spawn_blocking(|| ScreenCaptureService::capture(0, None, Some(1280))).await.unwrap_or(Err(crate::error::AppError::Screen("timeout".into()))) {
                             let mut screen_guard = cached_screenshot.write().await;
                             *screen_guard = Some(screen);
                         }
@@ -77,11 +77,11 @@ impl ContextPrewarmer {
     }
 
     pub async fn update_now(&self) {
-        if let Ok(tree) = tokio::task::spawn_blocking(|| get_focused_window_tree(6)).await.unwrap_or(Err(crate::error::AppError::A11y("err".into()))) {
+        if let Ok(tree) = tauri::async_runtime::spawn_blocking(|| get_focused_window_tree(6)).await.unwrap_or(Err(crate::error::AppError::A11y("err".into()))) {
             let mut a11y_guard = self.cached_a11y.write().await;
             *a11y_guard = Some(tree);
         }
-        if let Ok(screen) = tokio::task::spawn_blocking(|| ScreenCaptureService::capture(0, None, Some(1280))).await.unwrap_or(Err(crate::error::AppError::Screen("err".into()))) {
+        if let Ok(screen) = tauri::async_runtime::spawn_blocking(|| ScreenCaptureService::capture(0, None, Some(1280))).await.unwrap_or(Err(crate::error::AppError::Screen("err".into()))) {
             let mut screen_guard = self.cached_screenshot.write().await;
             *screen_guard = Some(screen);
         }

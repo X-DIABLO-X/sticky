@@ -68,7 +68,7 @@ impl DictationController {
         }
 
         // Capture focused screen context
-        let window_title = tokio::task::spawn_blocking(|| {
+        let window_title = tauri::async_runtime::spawn_blocking(|| {
             get_focused_window_tree(2).map(|t| t.window_title).unwrap_or_default()
         }).await.unwrap_or_default();
 
@@ -109,7 +109,7 @@ impl DictationController {
 /// Simulate typing / pasting text directly at active cursor caret
 pub async fn paste_to_caret(text: &str) -> Result<()> {
     let t = text.to_string();
-    tokio::task::spawn_blocking(move || {
+    tauri::async_runtime::spawn_blocking(move || {
         let mut sim = InputSimulator::new()?;
         sim.type_text(&t, false)?;
         Ok::<(), crate::error::AppError>(())
@@ -123,7 +123,7 @@ async fn self_learning_dictionary_hook(app: AppHandle, inserted: String, context
     for &sec in &check_intervals {
         tokio::time::sleep(Duration::from_secs(sec)).await;
 
-        let tree = tokio::task::spawn_blocking(|| get_focused_window_tree(3)).await;
+        let tree = tauri::async_runtime::spawn_blocking(|| get_focused_window_tree(3)).await;
         if let Ok(Ok(t)) = tree {
             let mut interactive = Vec::new();
             t.root.collect_interactive(&mut interactive);
