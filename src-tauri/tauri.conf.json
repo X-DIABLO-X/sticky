@@ -1,0 +1,93 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "heyclicky-core",
+  "version": "0.1.0",
+  "identifier": "com.heyclicky.clone",
+  "build": {
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "dashboard",
+        "title": "HeyClicky Desktop AI - Control Center",
+        "url": "index.html?window=dashboard",
+        "width": 1120,
+        "height": 760,
+        "minWidth": 860,
+        "minHeight": 600,
+        "resizable": true,
+        "transparent": false,
+        "decorations": true,
+        "alwaysOnTop": false,
+        "shadow": true,
+        "visible": true,
+        "center": true
+      },
+      {
+        "label": "pill",
+        "title": "HeyClicky Pill",
+        "url": "index.html?window=pill",
+        "width": 320,
+        "height": 56,
+        "resizable": true,
+        "transparent": true,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "shadow": false,
+        "visible": true
+      },
+      {
+        "label": "bubble",
+        "title": "HeyClicky Bubble",
+        "url": "index.html?window=bubble",
+        "width": 260,
+        "height": 64,
+        "resizable": false,
+        "transparent": true,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "shadow": false,
+        "visible": false
+      },
+      {
+        "label": "overlay",
+        "title": "HeyClicky Overlay",
+        "url": "index.html?window=overlay",
+        "fullscreen": true,
+        "transparent": true,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "shadow": false,
+        "visible": true
+      },
+      {
+        "label": "quick_input",
+        "title": "HeyClicky Quick Input",
+        "url": "index.html?window=quick_input",
+        "width": 600,
+        "height": 72,
+        "resizable": false,
+        "transparent": true,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "shadow": false,
+        "visible": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/icon.ico",
+      "icons/icon.png"
+    ]
+  }
+}

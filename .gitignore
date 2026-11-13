@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Production build artifacts
+dist/
+build/
+release/
+
+# Rust / Cargo
+src-tauri/target/
+target/
+**/*.rs.bk
+
+# Python cache & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# Environment and sensitive files
+.env
+.env.local
+*.log
+temp_tts_test.wav
+test_sample.wav
+
+# OS generated files
+.DS_Store
+Thumbs.db

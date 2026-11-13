@@ -1,0 +1,72 @@
+{
+  "Test 1: Global Shortcut & Hardware Hotkey Validation": {
+    "status": "PASS",
+    "duration_ms": 0.08670001989230514,
+    "details": {
+      "GetAsyncKeyState_functional": true,
+      "Ctrl_down": false,
+      "Space_down": false,
+      "Ctrl_Shift_Space_registerable": true
+    }
+  },
+  "Test 2: 60Hz Cursor Position & High-DPI Normalization": {
+    "status": "PASS",
+    "duration_ms": 0.02989999484270811,
+    "details": {
+      "physical_pos": [
+        0,
+        0
+      ],
+      "scaled_positions": [
+        {
+          "dpr": 1.0,
+          "logical_x": 0.0,
+          "logical_y": 0.0
+        },
+        {
+          "dpr": 1.25,
+          "logical_x": 0.0,
+          "logical_y": 0.0
+        },
+        {
+          "dpr": 1.5,
+          "logical_x": 0.0,
+          "logical_y": 0.0
+        }
+      ]
+    }
+  },
+  "Test 3: Local Offline Faster-Whisper STT Transcription": {
+    "status": "PASS",
+    "duration_ms": 1933.7205000047106,
+    "details": {
+      "transcript_output": "",
+      "exit_code": 0
+    }
+  },
+  "Test 4: Real-time Local Text-to-Speech (TTS) Synthesis": {
+    "status": "PASS",
+    "duration_ms": 403.5810999921523,
+    "details": {
+      "file_size_bytes": 154122,
+      "sample_rate": 22050,
+      "channels": 1,
+      "duration_sec": 3.49
+    }
+  },
+  "Test 5: Bonsai-2 9B Spatial Protocol & Tag Decoupling": {
+    "status": "PASS",
+    "duration_ms": 7811.255600012373,
+    "details": {
+      "raw_response": "Thinking Process:\n\n1.  **Analyze the Request:**\n    *   Persona: HeyClicky.\n    *   Task: Locate the Search button.\n    ...",
+      "has_point_tag": true,
+      "extracted_point": [
+        "420",
+        "180",
+        "Search Field"
+      ],
+      "clean_speech": "Thinking Process:\n\n1.  **Analyze the Request:**\n    *   Persona: HeyClicky.\n    ...",
+      "clean_speech_len": 1521
+    }
+  }
+}

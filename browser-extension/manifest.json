@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "HeyClicky Companion",
+  "version": "1.0.0",
+  "description": "Native Messaging and DOM grounder for the HeyClicky desktop assistant with hard sensitive-field redaction.",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "nativeMessaging",
+    "storage"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "action": {
+    "default_title": "HeyClicky Companion"
+  }
+}

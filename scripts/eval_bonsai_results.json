@@ -1,0 +1,236 @@
+{
+  "model": "bonsai-2:9b",
+  "evaluated_at": "2026-11-13T23:58:21Z",
+  "summary": {
+    "average_ttft_ms": 229.5,
+    "average_tok_per_sec": 62.63,
+    "average_adherence_percent": 100.0,
+    "all_tasks_passed": true
+  },
+  "tasks": [
+    {
+      "task_id": "A_TALK_MODE",
+      "name": "Talk Mode Spatial Query (Mock A11y Tree)",
+      "endpoint": "/api/chat (think=False)",
+      "think_mode": false,
+      "ttft_ms": 608.3569526672363,
+      "tokens_per_second": 62.53813558605839,
+      "total_latency_s": 1.199458360671997,
+      "eval_tokens": 37,
+      "adherence_score": 100.0,
+      "passed": true,
+      "raw_output": "You can clear your cache by clicking the \"Clear browsing data\" button right here.\n\n[POINT:450,450:Clear browsing data:screen0]",
+      "clean_speech": "You can clear your cache by clicking the \"Clear browsing data\" button right here.",
+      "parsed_commands": [
+        {
+          "type": "Point",
+          "x": 450,
+          "y": 450,
+          "label": "Clear browsing data",
+          "screen": "screen0"
+        }
+      ],
+      "tool_calls": [],
+      "diagnostics": [
+        "Parsed valid POINT: x=450, y=450, label='Clear browsing data', screen='screen0'",
+        "Coordinates accurately pinpoint the A11y button bounding box.",
+        "Natural spoken speech present for Kokoro TTS: 'You can clear your cache by clicking the \"Clear browsing data\" button right here.'"
+      ]
+    },
+    {
+      "task_id": "B_ANNOTATION_DRAW",
+      "name": "UI Layout Annotation ([DRAW:circle], [DRAW:arrow])",
+      "endpoint": "/api/chat (think=False)",
+      "think_mode": false,
+      "ttft_ms": 351.6983985900879,
+      "tokens_per_second": 62.016490025681186,
+      "total_latency_s": 1.6094865798950195,
+      "eval_tokens": 78,
+      "adherence_score": 100.0,
+      "passed": true,
+      "raw_output": "Got it! I'll highlight that save icon and show you where the files are.\n\n[POINT:150,40:Save Icon]\n[DRAW:circle:150,40,25:#3186ff]\n[DRAW:arrow:50,100,150,40:Move to Save]",
+      "clean_speech": "Got it! I'll highlight that save icon and show you where the files are.",
+      "parsed_commands": [
+        {
+          "type": "Point",
+          "x": 150,
+          "y": 40,
+          "label": "Save Icon",
+          "screen": "screen0"
+        },
+        {
+          "type": "Draw",
+          "shape": "circle",
+          "coords": [
+            150,
+            40,
+            25
+          ],
+          "color": "#3186ff",
+          "label": "#3186ff"
+        },
+        {
+          "type": "Draw",
+          "shape": "arrow",
+          "coords": [
+            50,
+            100,
+            150,
+            40
+          ],
+          "color": "Move to Save",
+          "label": "Move to Save"
+        }
+      ],
+      "tool_calls": [],
+      "diagnostics": [
+        "Parsed [DRAW:circle]: coords=[150, 40, 25], color=#3186ff",
+        "Parsed [DRAW:arrow]: coords=[50, 100, 150, 40], label=Move to Save",
+        "Arrow coordinates format valid: exactly 4 comma-separated integers."
+      ]
+    },
+    {
+      "task_id": "C_WALKTHROUGH_STEP",
+      "name": "3-Step Guided Walkthrough ([STEP:1/3:...] sequence)",
+      "endpoint": "/api/chat (think=False)",
+      "think_mode": false,
+      "ttft_ms": 99.3354320526123,
+      "tokens_per_second": 62.973045145296354,
+      "total_latency_s": 1.3485491275787354,
+      "eval_tokens": 79,
+      "adherence_score": 100.0,
+      "passed": true,
+      "raw_output": "[STEP:1/3:20,10,60,35:Click the File menu]\n[STEP:2/3:20,120,120,150:Select Export As]\n[STEP:3/3:450,550,550,590:Click Confirm]",
+      "clean_speech": "",
+      "parsed_commands": [
+        {
+          "type": "Step",
+          "index": 1,
+          "total": 3,
+          "bbox": [
+            20,
+            10,
+            60,
+            35
+          ],
+          "instruction": "Click the File menu"
+        },
+        {
+          "type": "Step",
+          "index": 2,
+          "total": 3,
+          "bbox": [
+            20,
+            120,
+            120,
+            150
+          ],
+          "instruction": "Select Export As"
+        },
+        {
+          "type": "Step",
+          "index": 3,
+          "total": 3,
+          "bbox": [
+            450,
+            550,
+            550,
+            590
+          ],
+          "instruction": "Click Confirm"
+        }
+      ],
+      "tool_calls": [],
+      "diagnostics": [
+        "Exactly 3 steps parsed by TagStreamParser.",
+        "Step index sequence (1/3, 2/3, 3/3) 100% compliant.",
+        "All bounding boxes parsed with exactly 4 normalized coordinates."
+      ]
+    },
+    {
+      "task_id": "D_DICTATION_CLEANUP",
+      "name": "Dictation Cleanup Protocol (Hotwords & Strict Formatting)",
+      "endpoint": "/api/chat (think=False)",
+      "think_mode": false,
+      "ttft_ms": 88.09876441955566,
+      "tokens_per_second": 63.30365974282889,
+      "total_latency_s": 0.5915665626525879,
+      "eval_tokens": 32,
+      "adherence_score": 100.0,
+      "passed": true,
+      "raw_output": "So basically, we need to run kubectl apply -f deployment.yaml and then check if the Tauri desktop app has AEC3 audio enabled.",
+      "clean_speech": "So basically, we need to run kubectl apply -f deployment.yaml and then check if the Tauri desktop app has AEC3 audio enabled.",
+      "parsed_commands": [],
+      "tool_calls": [],
+      "diagnostics": [
+        "Technical hotwords ('kubectl', 'Tauri', 'AEC3') correctly restored from phonetic audio.",
+        "Spoken filler words and disfluencies cleanly eliminated.",
+        "Zero conversational preamble detected.",
+        "Zero surrounding quotation marks detected.",
+        "Zero markdown backticks detected: 100% pure plain text output."
+      ]
+    },
+    {
+      "task_id": "E_TOOL_CALLING",
+      "name": "Autonomous Tool Calling (mouse_click & type_text)",
+      "endpoint": "/api/chat (think=False)",
+      "think_mode": false,
+      "ttft_ms": 0.0,
+      "tokens_per_second": 62.311590050160824,
+      "total_latency_s": 1.1528842449188232,
+      "eval_tokens": 66,
+      "adherence_score": 100.0,
+      "passed": true,
+      "raw_output": "",
+      "clean_speech": "",
+      "parsed_commands": [],
+      "tool_calls": [
+        {
+          "id": "call_chow5wk8",
+          "function": {
+            "index": 0,
+            "name": "mouse_click",
+            "arguments": {
+              "x": 400,
+              "y": 50,
+              "button": "left",
+              "screen_index": "screen0"
+            }
+          }
+        }
+      ],
+      "diagnostics": [
+        "Successfully generated 1 tool call(s).",
+        "Target tool 'mouse_click' matched schema definition.",
+        "Arguments compliant: x=400, y=50"
+      ]
+    },
+    {
+      "task_id": "CMP_TALK_THINKING_ON",
+      "name": "Latency Comparison: Talk Mode (think=True Baseline)",
+      "endpoint": "/api/chat (think=True)",
+      "think_mode": true,
+      "ttft_ms": 15077.906608581543,
+      "tokens_per_second": 61.36186401853485,
+      "total_latency_s": 15.460224151611328,
+      "eval_tokens": 927,
+      "adherence_score": 100.0,
+      "passed": true,
+      "raw_output": "I'm highlighting the Settings button for you [POINT:840,42:Settings:screen0].",
+      "clean_speech": "I'm highlighting the Settings button for you .",
+      "parsed_commands": [
+        {
+          "type": "Point",
+          "x": 840,
+          "y": 42,
+          "label": "Settings",
+          "screen": "screen0"
+        }
+      ],
+      "tool_calls": [],
+      "diagnostics": [
+        "Baseline latency measurement demonstrating why think=False is required for real-time speech."
+      ]
+    }
+  ]
+}

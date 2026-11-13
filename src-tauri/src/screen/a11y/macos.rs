@@ -1,0 +1,27 @@
+use crate::error::Result;
+use super::{A11yBackend, A11yNode, A11yTree};
+
+pub struct MacosA11yBackend;
+
+impl MacosA11yBackend {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl A11yBackend for MacosA11yBackend {
+    fn get_focused_window_tree(&self, _max_depth: usize) -> Result<A11yTree> {
+        Ok(A11yTree {
+            window_title: "Active macOS Window".to_string(),
+            root: A11yNode {
+                id: "macos_root".to_string(),
+                role: "Window".to_string(),
+                name: "Active Window".to_string(),
+                value: None,
+                bbox: [0, 0, 1920, 1080],
+                interactive: false,
+                children: vec![],
+            },
+        })
+    }
+}
