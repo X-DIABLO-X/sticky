@@ -96,33 +96,45 @@ impl AudioEngine {
         self.is_listening = false;
     }
 
-    /// Read incoming PCM samples, run AEC and VAD
-    pub fn process_tick(&mut self) -> Option<VadState> {
+    /// Read incoming PCM samples, run AEC and VAD across all available frames
+    pub fn process_tick(&mut self) -> Option<(VadState, f32)> {
         let consumer = self.ring_consumer.as_mut()?;
-        let available = consumer.slots_available();
-        if available < 480 {
-            // Need at least 30ms @ 16kHz (480 samples)
-            return None;
+        let mut last_state = None;
+        let mut max_rms: f32 = 0.0;
+
+        while consumer.slots_available() >= 480 {
+            let mut raw_chunk = vec![0.0f32; 480];
+            let read = consumer.pop_slice(&mut raw_chunk);
+            if read < 480 {
+                break;
+            }
+
+            // Process AEC
+            let mut clean_chunk = vec![0.0f32; 480];
+            let ref_zero = vec![0.0f32; 480];
+            self.aec.process_frame(&raw_chunk, &ref_zero, &mut clean_chunk);
+
+            // Compute RMS energy
+            let sum_sq: f32 = clean_chunk.iter().map(|&s| s * s).sum();
+            let rms = (sum_sq / clean_chunk.len() as f32).sqrt();
+            if rms > max_rms {
+                max_rms = rms;
+            }
+
+            // Run VAD
+            let state = self.vad.process_frame(&clean_chunk, Duration::from_millis(30));
+
+            // Save samples to buffer
+            self.recorded_buffer.extend_from_slice(&clean_chunk);
+
+            if state == VadState::SpeechStarted || state == VadState::Speaking {
+                last_state = Some(state);
+            } else if last_state.is_none() || last_state == Some(VadState::Silence) {
+                last_state = Some(state);
+            }
         }
 
-        let mut raw_chunk = vec![0.0f32; 480];
-        let read = consumer.pop_slice(&mut raw_chunk);
-        if read < 480 {
-            return None;
-        }
-
-        // Process AEC
-        let mut clean_chunk = vec![0.0f32; 480];
-        let ref_zero = vec![0.0f32; 480];
-        self.aec.process_frame(&raw_chunk, &ref_zero, &mut clean_chunk);
-
-        // Run VAD
-        let state = self.vad.process_frame(&clean_chunk, Duration::from_millis(30));
-
-        // Save samples to buffer
-        self.recorded_buffer.extend_from_slice(&clean_chunk);
-
-        Some(state)
+        last_state.map(|s| (s, max_rms))
     }
 
     pub async fn transcribe_recorded(&mut self) -> Result<String> {

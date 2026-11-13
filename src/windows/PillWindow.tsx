@@ -107,8 +107,13 @@ export const PillWindow: React.FC = () => {
       }
     );
 
+    const unlistenTalkState = listenEvent<string>("talk:state", (st) => {
+      setIsTalking(st === "Listening" || st === "Transcribing" || st === "Thinking" || st === "Speaking");
+    });
+
     return () => {
       unlistenStatus.then((un) => un());
+      unlistenTalkState.then((un) => un());
     };
   }, []);
 

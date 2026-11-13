@@ -94,8 +94,8 @@ impl HotkeyManager {
                 let pressed_at = TALK_PRESS_TIMESTAMP.load(Ordering::SeqCst);
                 let duration_ms = now - pressed_at;
 
-                // Push-to-Talk behavior: If held down for > 450ms, release automatically submits
-                if duration_ms > 450 {
+                // Push-to-Talk behavior: If held down for >= 180ms, release automatically submits
+                if duration_ms >= 180 {
                     let _ = tauri::Emitter::emit(app, "hotkey:talk_up", ());
                     if let Some(app_state) = app.try_state::<AppState>() {
                         let talk_ctrl = Arc::clone(&app_state.talk_controller);

@@ -86,9 +86,15 @@ export const BubbleWindow: React.FC = () => {
       }
     });
 
+    const unlistenAmplitude = listenEvent<number>("audio_amplitude", (rms) => {
+      const scaled = Math.min(26, Math.max(4, rms * 350));
+      audioLevelsRef.current = audioLevelsRef.current.map(() => Math.max(3, scaled + (Math.random() * 6 - 3)));
+    });
+
     return () => {
       unlistenTranscript.then((un) => un());
       unlistenAudioBytes.then((un) => un());
+      unlistenAmplitude.then((un) => un());
     };
   }, []);
 

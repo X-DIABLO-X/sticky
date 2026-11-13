@@ -58,6 +58,7 @@ impl CursorTracker {
             let mut last_click = false;
             let mut last_ctrl_space = false;
             let mut ctrl_space_cooldown = std::time::Instant::now();
+            let mut ctrl_space_press_start: Option<std::time::Instant> = None;
 
             while is_running.load(Ordering::Relaxed) {
                 interval.tick().await;
@@ -77,13 +78,16 @@ impl CursorTracker {
                     }));
                 }
 
-                // 2. Hardware-level Ctrl+Space keyboard detection (bypasses Windows IME / hotkey conflicts)
+                // 2. Hardware-level Ctrl+Space keyboard detection (Push-To-Talk + Tap-To-Toggle)
                 let ctrl_space = is_ctrl_space_pressed();
+
+                // Key DOWN: User pressed Ctrl + Space
                 if ctrl_space && !last_ctrl_space {
-                    // Debounce hotkey toggle: at least 350ms between toggles
-                    if ctrl_space_cooldown.elapsed() > Duration::from_millis(350) {
+                    ctrl_space_press_start = Some(std::time::Instant::now());
+                    eprintln!("[CursorTracker] Hardware Ctrl+Space DOWN detected!");
+
+                    if ctrl_space_cooldown.elapsed() > Duration::from_millis(250) {
                         ctrl_space_cooldown = std::time::Instant::now();
-                        eprintln!("[CursorTracker] Hardware Ctrl+Space detected! Toggling Talk Mode.");
 
                         if let Some(app_state) = app.try_state::<AppState>() {
                             let talk_ctrl = Arc::clone(&app_state.talk_controller);
@@ -96,6 +100,7 @@ impl CursorTracker {
                                     let _ = tauri::Emitter::emit(&app_handle, "hotkey:talk_down", ());
                                     let _ = talk_ctrl.start_talk().await;
                                 } else if current == crate::features::talk::TalkState::Listening {
+                                    // If already listening and user taps again, toggle off
                                     let _ = tauri::Emitter::emit(&app_handle, "hotkey:talk_up", ());
                                     let _ = talk_ctrl.stop_talk().await;
                                 }
@@ -103,6 +108,33 @@ impl CursorTracker {
                         }
                     }
                 }
+
+                // Key UP: User released Ctrl or Space
+                if !ctrl_space && last_ctrl_space {
+                    let held_ms = ctrl_space_press_start
+                        .take()
+                        .map(|t| t.elapsed().as_millis())
+                        .unwrap_or(0);
+
+                    eprintln!("[CursorTracker] Hardware Ctrl+Space UP detected! Held for {}ms", held_ms);
+
+                    // Push-to-Talk: If user held Ctrl+Space for >= 180ms, releasing immediately stops recording & submits!
+                    if held_ms >= 180 {
+                        if let Some(app_state) = app.try_state::<AppState>() {
+                            let talk_ctrl = Arc::clone(&app_state.talk_controller);
+                            let app_handle = app.clone();
+                            tauri::async_runtime::spawn(async move {
+                                let current = talk_ctrl.get_state().await;
+                                if current == crate::features::talk::TalkState::Listening {
+                                    eprintln!("[CursorTracker] Push-to-Talk release -> Stopping talk and submitting to LLM.");
+                                    let _ = tauri::Emitter::emit(&app_handle, "hotkey:talk_up", ());
+                                    let _ = talk_ctrl.stop_talk().await;
+                                }
+                            });
+                        }
+                    }
+                }
+
                 last_ctrl_space = ctrl_space;
             }
         });

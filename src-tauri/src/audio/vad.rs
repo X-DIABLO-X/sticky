@@ -21,7 +21,7 @@ pub struct VoiceActivityDetector {
 
 impl Default for VoiceActivityDetector {
     fn default() -> Self {
-        Self::new(0.015, Duration::from_millis(200))
+        Self::new(0.008, Duration::from_millis(300))
     }
 }
 
@@ -35,7 +35,7 @@ impl VoiceActivityDetector {
             last_speech_time: None,
             first_speech_time: None,
             is_speaking: false,
-            adaptive_floor: 0.005,
+            adaptive_floor: 0.003,
         }
     }
 
@@ -51,12 +51,12 @@ impl VoiceActivityDetector {
 
         // Dynamically track background noise floor
         if rms < self.adaptive_floor {
-            self.adaptive_floor = 0.95 * self.adaptive_floor + 0.05 * rms;
+            self.adaptive_floor = 0.92 * self.adaptive_floor + 0.08 * rms;
         } else {
-            self.adaptive_floor = 0.999 * self.adaptive_floor + 0.001 * rms;
+            self.adaptive_floor = 0.998 * self.adaptive_floor + 0.002 * rms;
         }
 
-        let effective_threshold = (self.energy_threshold).max(self.adaptive_floor * 3.0);
+        let effective_threshold = (self.energy_threshold).max(self.adaptive_floor * 2.2);
         let has_speech = rms > effective_threshold;
 
         if has_speech {
