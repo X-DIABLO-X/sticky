@@ -33,3 +33,7 @@ test_sample.wav
 # OS generated files
 .DS_Store
 Thumbs.db
+
+# Bundles & temp archives
+sticky-fixes-bundle/
+*.zip

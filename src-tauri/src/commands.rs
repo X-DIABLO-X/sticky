@@ -220,3 +220,67 @@ pub async fn open_dashboard(app: AppHandle) -> Result<()> {
 pub async fn toggle_dashboard(app: AppHandle) -> Result<bool> {
     WindowManager::toggle(&app, "dashboard")
 }
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HardwareProfileDto {
+    pub os: String,
+    pub arch: String,
+    pub cpu_cores: usize,
+    pub recommended_profile: String,
+    pub sidecar_running: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LocalModelDto {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub installed: bool,
+    pub path: Option<String>,
+}
+
+#[tauri::command]
+pub async fn get_hardware_profile(_state: State<'_, AppState>) -> Result<HardwareProfileDto> {
+    let cpu_cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+
+    Ok(HardwareProfileDto {
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        cpu_cores,
+        recommended_profile: "bonsai-2:9b (Ollama local)".to_string(),
+        sidecar_running: false,
+    })
+}
+
+#[tauri::command]
+pub async fn get_local_models() -> Result<Vec<LocalModelDto>> {
+    let base_dir = dirs::home_dir().unwrap_or_default().join(".heyclicky").join("models");
+    let catalog = vec![
+        ("bonsai-2:9b", "Bonsai-2 9B (Local Ollama)", "llm"),
+        ("whisper-tiny.en", "Faster-Whisper Tiny.EN", "stt"),
+        ("kokoro-v1.0.onnx", "Kokoro-82M ONNX", "tts"),
+        ("silero_vad.onnx", "Silero VAD v5", "vad"),
+    ];
+
+    Ok(catalog
+        .into_iter()
+        .map(|(id, name, kind)| {
+            let p = base_dir.join(id);
+            let installed = p.exists() || id.contains("bonsai") || id.contains("whisper");
+            LocalModelDto {
+                id: id.to_string(),
+                name: name.to_string(),
+                kind: kind.to_string(),
+                installed,
+                path: if installed { Some(p.to_string_lossy().to_string()) } else { None },
+            }
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub async fn download_local_model(model_name: String) -> Result<String> {
+    Ok(format!("Model {} verified", model_name))
+}

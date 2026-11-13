@@ -55,14 +55,14 @@ impl KokoroTts {
             return Ok(());
         }
 
-        let script_path = "D:\\cliky\\scripts\\speak.ps1";
+        let script_path = crate::audio::stt::resolve_script_path("speak.ps1");
         let temp_wav = std::env::temp_dir().join(format!("tts_{}.wav", uuid::Uuid::new_v4()));
 
         let status = tokio::process::Command::new("powershell")
             .arg("-ExecutionPolicy")
             .arg("Bypass")
             .arg("-File")
-            .arg(script_path)
+            .arg(&script_path)
             .arg("-Text")
             .arg(clean_text)
             .arg("-OutFile")
@@ -104,7 +104,7 @@ impl KokoroTts {
             .arg("-ExecutionPolicy")
             .arg("Bypass")
             .arg("-File")
-            .arg(script_path)
+            .arg(&script_path)
             .arg("-Text")
             .arg(clean_text)
             .spawn();

@@ -8,6 +8,8 @@ use crate::error::{AppError, Result};
 pub struct AudioInputHandle {
     pub stream: cpal::Stream,
     pub is_running: Arc<AtomicBool>,
+    pub sample_rate: u32,
+    pub channels: u16,
 }
 
 unsafe impl Send for AudioInputHandle {}
@@ -31,6 +33,7 @@ pub fn create_input_stream(
         .map_err(|e| AppError::Audio(format!("Failed to get default input config: {}", e)))?;
 
     let channels = supported_config.channels();
+    let sample_rate = supported_config.sample_rate().0;
 
     let is_running = Arc::new(AtomicBool::new(true));
     let running_flag = Arc::clone(&is_running);
@@ -77,6 +80,8 @@ pub fn create_input_stream(
     Ok(AudioInputHandle {
         stream,
         is_running,
+        sample_rate,
+        channels,
     })
 }
 

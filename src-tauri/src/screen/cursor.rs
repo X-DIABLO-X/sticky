@@ -56,9 +56,8 @@ impl CursorTracker {
             let mut interval = tokio::time::interval(Duration::from_millis(16)); // ~60 FPS
             let mut last_pos = (-1, -1);
             let mut last_click = false;
-            let mut last_ctrl_space = false;
-            let mut ctrl_space_cooldown = std::time::Instant::now();
-            let mut ctrl_space_press_start: Option<std::time::Instant> = None;
+            let mut is_push_to_talk_active = false;
+            let mut press_start_time = std::time::Instant::now();
 
             while is_running.load(Ordering::Relaxed) {
                 interval.tick().await;
@@ -78,64 +77,42 @@ impl CursorTracker {
                     }));
                 }
 
-                // 2. Hardware-level Ctrl+Space keyboard detection (Push-To-Talk + Tap-To-Toggle)
+                // 2. Hardware-level Ctrl+Space keyboard detection (Instant Push-To-Talk)
                 let ctrl_space = is_ctrl_space_pressed();
 
-                // Key DOWN: User pressed Ctrl + Space
-                if ctrl_space && !last_ctrl_space {
-                    ctrl_space_press_start = Some(std::time::Instant::now());
-                    eprintln!("[CursorTracker] Hardware Ctrl+Space DOWN detected!");
+                if ctrl_space && !is_push_to_talk_active {
+                    // User pressed and started holding Ctrl + Space
+                    is_push_to_talk_active = true;
+                    press_start_time = std::time::Instant::now();
 
-                    if ctrl_space_cooldown.elapsed() > Duration::from_millis(250) {
-                        ctrl_space_cooldown = std::time::Instant::now();
+                    println!("\n[Hotkeys] >>> Ctrl+Space HELD: Starting Voice Capture (Speak now)...");
 
-                        if let Some(app_state) = app.try_state::<AppState>() {
-                            let talk_ctrl = Arc::clone(&app_state.talk_controller);
-                            let app_handle = app.clone();
-                            tauri::async_runtime::spawn(async move {
-                                let current = talk_ctrl.get_state().await;
-                                if current == crate::features::talk::TalkState::Idle {
-                                    let _ = WindowManager::show(&app_handle, "bubble");
-                                    let _ = WindowManager::position_bubble_at_cursor(&app_handle);
-                                    let _ = tauri::Emitter::emit(&app_handle, "hotkey:talk_down", ());
-                                    let _ = talk_ctrl.start_talk().await;
-                                } else if current == crate::features::talk::TalkState::Listening {
-                                    // If already listening and user taps again, toggle off
-                                    let _ = tauri::Emitter::emit(&app_handle, "hotkey:talk_up", ());
-                                    let _ = talk_ctrl.stop_talk().await;
-                                }
-                            });
-                        }
+                    if let Some(app_state) = app.try_state::<AppState>() {
+                        let talk_ctrl = Arc::clone(&app_state.talk_controller);
+                        let app_handle = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let _ = WindowManager::show(&app_handle, "bubble");
+                            let _ = WindowManager::position_bubble_at_cursor(&app_handle);
+                            let _ = tauri::Emitter::emit(&app_handle, "hotkey:talk_down", ());
+                            let _ = talk_ctrl.start_talk().await;
+                        });
+                    }
+                } else if !ctrl_space && is_push_to_talk_active {
+                    // User released Ctrl or Space -> Stop recording immediately and submit
+                    is_push_to_talk_active = false;
+                    let held_duration = press_start_time.elapsed();
+
+                    println!("\n[Hotkeys] <<< Ctrl+Space RELEASED (held for {:.2}s): Stopping Voice Capture & Submitting to LLM...", held_duration.as_secs_f32());
+
+                    if let Some(app_state) = app.try_state::<AppState>() {
+                        let talk_ctrl = Arc::clone(&app_state.talk_controller);
+                        let app_handle = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let _ = tauri::Emitter::emit(&app_handle, "hotkey:talk_up", ());
+                            let _ = talk_ctrl.stop_talk().await;
+                        });
                     }
                 }
-
-                // Key UP: User released Ctrl or Space
-                if !ctrl_space && last_ctrl_space {
-                    let held_ms = ctrl_space_press_start
-                        .take()
-                        .map(|t| t.elapsed().as_millis())
-                        .unwrap_or(0);
-
-                    eprintln!("[CursorTracker] Hardware Ctrl+Space UP detected! Held for {}ms", held_ms);
-
-                    // Push-to-Talk: If user held Ctrl+Space for >= 180ms, releasing immediately stops recording & submits!
-                    if held_ms >= 180 {
-                        if let Some(app_state) = app.try_state::<AppState>() {
-                            let talk_ctrl = Arc::clone(&app_state.talk_controller);
-                            let app_handle = app.clone();
-                            tauri::async_runtime::spawn(async move {
-                                let current = talk_ctrl.get_state().await;
-                                if current == crate::features::talk::TalkState::Listening {
-                                    eprintln!("[CursorTracker] Push-to-Talk release -> Stopping talk and submitting to LLM.");
-                                    let _ = tauri::Emitter::emit(&app_handle, "hotkey:talk_up", ());
-                                    let _ = talk_ctrl.stop_talk().await;
-                                }
-                            });
-                        }
-                    }
-                }
-
-                last_ctrl_space = ctrl_space;
             }
         });
     }

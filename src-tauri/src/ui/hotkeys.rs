@@ -27,16 +27,13 @@ impl HotkeyManager {
             eprintln!("[Hotkeys] QuickInput hotkey ('{}') registration: {:?}", config.quick_input, res.is_ok());
         }
 
-        // Register Talk hotkey (try configured string e.g. "Ctrl+Space")
-        if let Ok(shortcut) = config.talk.parse::<Shortcut>() {
-            let res = global_shortcut.register(shortcut);
-            eprintln!("[Hotkeys] Primary Talk hotkey ('{}') registration: {:?}", config.talk, res.is_ok());
-        }
+        // Primary Talk hotkey (Ctrl+Space) is handled exclusively via 60Hz hardware poller for instant Push-to-Talk
+        println!("[Hotkeys] Primary Talk hotkey ('{}') managed via 60Hz hardware poller (Push-to-Talk)", config.talk);
 
         // Register secondary fallback for Talk: "Ctrl+Shift+Space"
         if let Ok(alt_talk) = "Ctrl+Shift+Space".parse::<Shortcut>() {
             let res = global_shortcut.register(alt_talk);
-            eprintln!("[Hotkeys] Secondary Talk hotkey ('Ctrl+Shift+Space') registration: {:?}", res.is_ok());
+            println!("[Hotkeys] Secondary Talk hotkey ('Ctrl+Shift+Space') registration: {:?}", res.is_ok());
         }
 
         // Register Dictation hotkey

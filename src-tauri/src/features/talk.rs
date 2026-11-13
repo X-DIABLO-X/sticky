@@ -229,8 +229,14 @@ impl TalkController {
             }
             *state = TalkState::Transcribing;
             let _ = self.app_handle.emit("talk:state", TalkState::Transcribing);
+            let _ = self.app_handle.emit("transcript_chunk", serde_json::json!({
+                "text": "Transcribing speech...",
+                "speaker": "user",
+                "audioActive": false
+            }));
         }
 
+        println!("[Talk] Transcribing audio buffer...");
         let mut engine = self.audio_engine.lock().await;
         engine.stop_mic();
         let raw_transcript = engine.transcribe_recorded().await?;
@@ -238,12 +244,17 @@ impl TalkController {
 
         let transcript = raw_transcript.trim().to_string();
         if transcript.is_empty() {
+            println!("[Speech Text]: (No speech detected in audio)");
             let mut state = self.current_state.lock().await;
             *state = TalkState::Idle;
             let _ = self.app_handle.emit("talk:state", TalkState::Idle);
             let _ = WindowManager::hide(&self.app_handle, "bubble");
             return Ok(());
         }
+
+        println!("\n=======================================================");
+        println!("[Speech Text]: \"{}\"", transcript);
+        println!("=======================================================\n");
 
         let _ = self.app_handle.emit("talk:transcript", &transcript);
         let _ = self.app_handle.emit("transcript_chunk", serde_json::json!({
@@ -263,6 +274,8 @@ impl TalkController {
                 "audioActive": true
             }));
         }
+
+        println!("[Talk] Querying Bonsai-2 9B model...");
 
         // Fetch pre-warmed context (A11y tree + screen capture)
         let (a11y, screen) = self.prewarmer.get_cached_context().await;
@@ -361,6 +374,11 @@ impl TalkController {
         let mut eng = audio_engine.lock().await;
         let _ = eng.flush_tts().await;
         drop(eng);
+
+        if !full_assistant_response.is_empty() {
+            println!("\n[Clicky AI Response]: \"{}\"", full_assistant_response);
+            println!("-------------------------------------------------------\n");
+        }
 
         let mut state = self.current_state.lock().await;
         *state = TalkState::Idle;

@@ -257,6 +257,9 @@ pub fn run() {
             commands::set_active_model,
             commands::open_dashboard,
             commands::toggle_dashboard,
+            commands::get_hardware_profile,
+            commands::get_local_models,
+            commands::download_local_model,
         ])
         .build(tauri::generate_context!())
         .expect("error while building heyclicky application")

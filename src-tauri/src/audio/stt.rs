@@ -45,10 +45,11 @@ impl SttService {
         }
 
         // 2. Local offline fallback using faster-whisper via local_stt.py
+        let script_path = resolve_script_path("local_stt.py");
         let temp_wav = std::env::temp_dir().join(format!("stt_{}.wav", uuid::Uuid::new_v4()));
         if std::fs::write(&temp_wav, &wav_bytes).is_ok() {
             let output = tokio::process::Command::new("python")
-                .arg("D:\\cliky\\scripts\\local_stt.py")
+                .arg(&script_path)
                 .arg(temp_wav.to_string_lossy().to_string())
                 .output()
                 .await;
@@ -122,4 +123,26 @@ pub fn encode_wav_pcm16(samples: &[f32], sample_rate: u32, channels: u16) -> Res
         .map_err(|e| AppError::Audio(format!("Failed to finalize WAV: {}", e)))?;
 
     Ok(cursor.into_inner())
+}
+
+pub fn resolve_script_path(filename: &str) -> std::path::PathBuf {
+    let mut candidates = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("scripts").join(filename));
+        candidates.push(cwd.join("..").join("scripts").join(filename));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("scripts").join(filename));
+            candidates.push(dir.join("..").join("scripts").join(filename));
+        }
+    }
+    candidates.push(std::path::PathBuf::from(format!("D:\\cliky\\scripts\\{}", filename)));
+
+    for c in candidates {
+        if c.exists() {
+            return c;
+        }
+    }
+    std::path::PathBuf::from(format!("D:\\cliky\\scripts\\{}", filename))
 }

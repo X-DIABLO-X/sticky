@@ -21,11 +21,12 @@ pub struct AudioEngine {
     input_handle: Option<AudioInputHandle>,
     output_handle: Arc<Mutex<Option<AudioOutputHandle>>>,
     vad: VoiceActivityDetector,
-    aec: AecProcessor,
+    _aec: AecProcessor,
     stt: SttService,
     tts: KokoroTts,
     is_listening: bool,
     recorded_buffer: Vec<f32>,
+    pub mic_sample_rate: u32,
 }
 
 impl AudioEngine {
@@ -41,11 +42,12 @@ impl AudioEngine {
             input_handle: None,
             output_handle,
             vad,
-            aec,
+            _aec: aec,
             stt,
             tts,
             is_listening: false,
-            recorded_buffer: Vec::with_capacity(16000 * 30), // 30 sec buffer
+            recorded_buffer: Vec::with_capacity(48000 * 30), // 30 sec buffer
+            mic_sample_rate: 44100,
         }
     }
 
@@ -68,11 +70,12 @@ impl AudioEngine {
         self.recorded_buffer.clear();
         self.vad.reset();
 
-        // 16kHz audio: create ring buffer for ~4 seconds
-        let (producer, consumer) = create_audio_ring_buffer(65536);
+        // High capacity ring buffer for microphone streaming
+        let (producer, consumer) = create_audio_ring_buffer(131072);
         self.ring_consumer = Some(consumer);
 
         let input_handle = create_input_stream(producer)?;
+        self.mic_sample_rate = input_handle.sample_rate;
         self.input_handle = Some(input_handle);
         self.is_listening = true;
 
@@ -96,36 +99,34 @@ impl AudioEngine {
         self.is_listening = false;
     }
 
-    /// Read incoming PCM samples, run AEC and VAD across all available frames
+    /// Read incoming PCM samples, compute RMS and run VAD across all available frames
     pub fn process_tick(&mut self) -> Option<(VadState, f32)> {
         let consumer = self.ring_consumer.as_mut()?;
         let mut last_state = None;
         let mut max_rms: f32 = 0.0;
 
-        while consumer.slots_available() >= 480 {
-            let mut raw_chunk = vec![0.0f32; 480];
-            let read = consumer.pop_slice(&mut raw_chunk);
-            if read < 480 {
+        let sample_rate = if self.mic_sample_rate > 0 { self.mic_sample_rate } else { 44100 };
+        let chunk_size = (sample_rate as usize * 30) / 1000; // 30ms chunk
+
+        while consumer.slots_available() >= chunk_size {
+            let mut chunk = vec![0.0f32; chunk_size];
+            let read = consumer.pop_slice(&mut chunk);
+            if read < chunk_size {
                 break;
             }
 
-            // Process AEC
-            let mut clean_chunk = vec![0.0f32; 480];
-            let ref_zero = vec![0.0f32; 480];
-            self.aec.process_frame(&raw_chunk, &ref_zero, &mut clean_chunk);
-
-            // Compute RMS energy
-            let sum_sq: f32 = clean_chunk.iter().map(|&s| s * s).sum();
-            let rms = (sum_sq / clean_chunk.len() as f32).sqrt();
+            // Compute RMS energy directly from microphone signal
+            let sum_sq: f32 = chunk.iter().map(|&s| s * s).sum();
+            let rms = (sum_sq / chunk.len() as f32).sqrt();
             if rms > max_rms {
                 max_rms = rms;
             }
 
-            // Run VAD
-            let state = self.vad.process_frame(&clean_chunk, Duration::from_millis(30));
+            // Run VAD on frame
+            let state = self.vad.process_frame(&chunk, Duration::from_millis(30));
 
-            // Save samples to buffer
-            self.recorded_buffer.extend_from_slice(&clean_chunk);
+            // Save clean mic audio to recorded buffer for Whisper transcription
+            self.recorded_buffer.extend_from_slice(&chunk);
 
             if state == VadState::SpeechStarted || state == VadState::Speaking {
                 last_state = Some(state);
@@ -139,7 +140,8 @@ impl AudioEngine {
 
     pub async fn transcribe_recorded(&mut self) -> Result<String> {
         let samples = std::mem::take(&mut self.recorded_buffer);
-        self.stt.transcribe(&samples, 16000).await
+        let sample_rate = if self.mic_sample_rate > 0 { self.mic_sample_rate } else { 44100 };
+        self.stt.transcribe(&samples, sample_rate).await
     }
 
     pub async fn barge_in_flush(&mut self) {
