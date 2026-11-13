@@ -153,16 +153,16 @@ pub fn run() {
             // Setup Global Hotkeys
             let _ = HotkeyManager::setup_hotkeys(&handle, &config.hotkeys);
 
-            // Ensure Dashboard Window is displayed on startup
-            let _ = WindowManager::show(&handle, "dashboard");
+            // Overlay window defaults to click-through and displayed
+            let _ = WindowManager::set_ignore_cursor_events(&handle, "overlay", true);
+            let _ = WindowManager::show(&handle, "overlay");
 
             // Position Pill window top center and display
             let _ = WindowManager::position_pill_top_center(&handle);
             let _ = WindowManager::show(&handle, "pill");
 
-            // Overlay window defaults to click-through and displayed
-            let _ = WindowManager::set_ignore_cursor_events(&handle, "overlay", true);
-            let _ = WindowManager::show(&handle, "overlay");
+            // Ensure Dashboard Window is displayed on startup front and center
+            let _ = WindowManager::show(&handle, "dashboard");
 
             // Store AppState
             app.manage(AppState {

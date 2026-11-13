@@ -1,11 +1,11 @@
-# HeyClicky Clone: Zero-Latency Desktop AI Assistant
+# Sticky: Zero-Latency Multimodal Desktop AI Co-Pilot
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform: Windows | macOS | Linux](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)](README.md)
 [![Audio Latency: <300ms TTFA](https://img.shields.io/badge/Voice%20TTFA-%3C300ms-brightgreen.svg)](docs/03-ai-and-models/pipelines.md)
-[![100% Zero-Cost Models](https://img.shields.io/badge/Models-Open--Weight%20%2F%20Free--Tier-orange.svg)](docs/03-ai-and-models/models.md)
+[![100% Zero-Cost Models](https://img.shields.io/badge/Models-Open--Weight%20%2F%20Bonsai--2%209B-orange.svg)](docs/03-ai-and-models/models.md)
 
-HeyClicky Clone is an ultra-fast, privacy-first desktop voice and screen AI agent. Built on **Tauri v2**, **Rust**, **React 19**, and in-process **ONNX Runtime**, it provides sub-300ms spoken conversation, Excalidraw-style spatial screen annotations, system-wide smart dictation with self-learning vocabulary, desktop UI automation with safety watchdogs, background scheduled routines ("Clickys"), and dual browser automation via CDP and Chrome MV3 Native Messaging with hard credential redaction.
+**Sticky** is an ultra-fast, privacy-first desktop voice and screen AI agent companion (HeyClicky clone). Built on **Tauri v2**, **Rust**, **React 19**, and local **Ollama (`bonsai-2:9b`)**, it provides sub-300ms spoken conversation, real-time cursor companion following, Excalidraw-style spatial screen annotations, system-wide smart dictation with self-learning vocabulary, desktop UI automation with safety watchdogs, background scheduled routines ("Clickys"), and dual browser automation via CDP and Chrome MV3 Native Messaging with hard credential redaction.
 
 ---
 

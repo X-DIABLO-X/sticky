@@ -8,6 +8,7 @@ impl WindowManager {
     pub fn show(app: &AppHandle, label: &str) -> Result<()> {
         let win = app.get_webview_window(label)
             .ok_or_else(|| AppError::Ui(format!("Window '{}' not found", label)))?;
+        let _ = win.unminimize();
         win.show().map_err(|e| AppError::Ui(format!("Failed to show window {}: {}", label, e)))?;
         win.set_focus().map_err(|e| AppError::Ui(format!("Failed to focus window {}: {}", label, e)))?;
         Ok(())
