@@ -79,9 +79,11 @@ impl HotkeyManager {
                             let _ = WindowManager::show(&app_handle, "bubble");
                             let _ = WindowManager::position_bubble_at_cursor(&app_handle);
                             let _ = tauri::Emitter::emit(&app_handle, "hotkey:talk_down", ());
+                            let _ = tauri::Emitter::emit(&app_handle, "cursor:ptt_start", ());
                             let _ = talk_ctrl.start_talk().await;
                         } else if current == crate::features::talk::TalkState::Listening {
                             let _ = tauri::Emitter::emit(&app_handle, "hotkey:talk_up", ());
+                            let _ = tauri::Emitter::emit(&app_handle, "cursor:ptt_stop", ());
                             let _ = talk_ctrl.stop_talk().await;
                         }
                     });
@@ -94,6 +96,7 @@ impl HotkeyManager {
                 // Push-to-Talk behavior: If held down for >= 180ms, release automatically submits
                 if duration_ms >= 180 {
                     let _ = tauri::Emitter::emit(app, "hotkey:talk_up", ());
+                    let _ = tauri::Emitter::emit(app, "cursor:ptt_stop", ());
                     if let Some(app_state) = app.try_state::<AppState>() {
                         let talk_ctrl = Arc::clone(&app_state.talk_controller);
                         tauri::async_runtime::spawn(async move {

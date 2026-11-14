@@ -94,6 +94,7 @@ impl CursorTracker {
                             let _ = WindowManager::show(&app_handle, "bubble");
                             let _ = WindowManager::position_bubble_at_cursor(&app_handle);
                             let _ = tauri::Emitter::emit(&app_handle, "hotkey:talk_down", ());
+                            let _ = tauri::Emitter::emit(&app_handle, "cursor:ptt_start", ());
                             let _ = talk_ctrl.start_talk().await;
                         });
                     }
@@ -109,6 +110,7 @@ impl CursorTracker {
                         let app_handle = app.clone();
                         tauri::async_runtime::spawn(async move {
                             let _ = tauri::Emitter::emit(&app_handle, "hotkey:talk_up", ());
+                            let _ = tauri::Emitter::emit(&app_handle, "cursor:ptt_stop", ());
                             let _ = talk_ctrl.stop_talk().await;
                         });
                     }

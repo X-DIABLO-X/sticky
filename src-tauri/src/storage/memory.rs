@@ -157,4 +157,19 @@ impl MemoryRepository {
 
         Ok(hotwords)
     }
+
+    pub fn list_memories(&self, scope: Option<&str>) -> Result<Vec<MemoryEntry>> {
+        self.get_memories(scope)
+    }
+
+    pub fn upsert_memory(&self, scope: &str, key: &str, value: &str) -> Result<MemoryEntry> {
+        self.save_memory(scope, key, value)
+    }
+
+    pub fn clear_all(&self) -> Result<()> {
+        let conn = self.db.conn();
+        conn.execute("DELETE FROM memories", [])
+            .map_err(|e| AppError::Storage(format!("Failed to clear memories: {e}")))?;
+        Ok(())
+    }
 }

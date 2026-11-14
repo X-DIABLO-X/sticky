@@ -19,6 +19,10 @@ pub enum AppError {
     Config(String),
     #[error("UI error: {0}")]
     Ui(String),
+    #[error("Input simulation error: {0}")]
+    Input(String),
+    #[error("Network error: {0}")]
+    Network(String),
     #[error("Drive watchdog aborted: {0}")]
     DriveAborted(String),
     #[error("Internal error: {0}")]

@@ -20,6 +20,18 @@ pub struct AudioOutputHandle {
     pub sink: Arc<Sink>,
 }
 
+impl AudioOutputHandle {
+    pub fn stop(&self) {
+        self.sink.stop();
+    }
+
+    pub fn play_pcm_f32(&self, samples: Vec<f32>, sample_rate: u32, channels: u16) {
+        let buf = SamplesBuffer::new(channels, sample_rate, samples);
+        self.sink.append(buf);
+        self.sink.play();
+    }
+}
+
 pub fn create_input_stream(
     mut producer: AudioRingProducer,
 ) -> Result<AudioInputHandle> {
@@ -32,39 +44,82 @@ pub fn create_input_stream(
         .default_input_config()
         .map_err(|e| AppError::Audio(format!("Failed to get default input config: {}", e)))?;
 
-    let channels = supported_config.channels();
-    let sample_rate = supported_config.sample_rate().0;
+    let channels = supported_config.channels() as usize;
+    let src_rate = supported_config.sample_rate().0;
+    let target_rate = 16000u32;
 
     let is_running = Arc::new(AtomicBool::new(true));
     let running_flag = Arc::clone(&is_running);
 
-    let err_fn = |err| eprintln!("Audio input error: {}", err);
+    let err_fn = |err| eprintln!("[Audio Input Error]: {}", err);
+    let config: cpal::StreamConfig = supported_config.clone().into();
 
     let stream = match supported_config.sample_format() {
         cpal::SampleFormat::F32 => device.build_input_stream(
-            &supported_config.into(),
+            &config,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                if !running_flag.load(Ordering::Relaxed) {
+                if !running_flag.load(Ordering::Relaxed) || channels == 0 {
                     return;
                 }
-                for chunk in data.chunks(channels as usize) {
-                    let mono_sample = chunk.iter().sum::<f32>() / (channels as f32);
-                    producer.push(mono_sample);
+                // 1. Downmix interleaved multi-channel frames to mono
+                let frame_count = data.len() / channels;
+                let mut mono = Vec::with_capacity(frame_count);
+                for frame in data.chunks_exact(channels) {
+                    let sum: f32 = frame.iter().copied().sum();
+                    mono.push(sum / channels as f32);
+                }
+
+                // 2. Linear resample to 16,000 Hz
+                if src_rate == target_rate || src_rate == 0 {
+                    for &s in &mono {
+                        let _ = producer.push(s);
+                    }
+                } else {
+                    let ratio = src_rate as f64 / target_rate as f64;
+                    let out_len = ((mono.len() as f64) / ratio).floor() as usize;
+                    for i in 0..out_len {
+                        let src_idx = i as f64 * ratio;
+                        let idx0 = src_idx.floor() as usize;
+                        let idx1 = (idx0 + 1).min(mono.len().saturating_sub(1));
+                        let frac = (src_idx - idx0 as f64) as f32;
+                        let sample = mono[idx0] * (1.0 - frac) + mono[idx1] * frac;
+                        let _ = producer.push(sample);
+                    }
                 }
             },
             err_fn,
             None,
         ),
         cpal::SampleFormat::I16 => device.build_input_stream(
-            &supported_config.into(),
+            &config,
             move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                if !running_flag.load(Ordering::Relaxed) {
+                if !running_flag.load(Ordering::Relaxed) || channels == 0 {
                     return;
                 }
-                for chunk in data.chunks(channels as usize) {
-                    let sum = chunk.iter().map(|&s| s as f32 / i16::MAX as f32).sum::<f32>();
-                    let mono_sample = sum / (channels as f32);
-                    producer.push(mono_sample);
+                // 1. Downmix interleaved multi-channel frames to mono
+                let frame_count = data.len() / channels;
+                let mut mono = Vec::with_capacity(frame_count);
+                for frame in data.chunks_exact(channels) {
+                    let sum: f32 = frame.iter().map(|&s| s as f32 / i16::MAX as f32).sum();
+                    mono.push(sum / channels as f32);
+                }
+
+                // 2. Linear resample to 16,000 Hz
+                if src_rate == target_rate || src_rate == 0 {
+                    for &s in &mono {
+                        let _ = producer.push(s);
+                    }
+                } else {
+                    let ratio = src_rate as f64 / target_rate as f64;
+                    let out_len = ((mono.len() as f64) / ratio).floor() as usize;
+                    for i in 0..out_len {
+                        let src_idx = i as f64 * ratio;
+                        let idx0 = src_idx.floor() as usize;
+                        let idx1 = (idx0 + 1).min(mono.len().saturating_sub(1));
+                        let frac = (src_idx - idx0 as f64) as f32;
+                        let sample = mono[idx0] * (1.0 - frac) + mono[idx1] * frac;
+                        let _ = producer.push(sample);
+                    }
                 }
             },
             err_fn,
@@ -74,14 +129,15 @@ pub fn create_input_stream(
     }
     .map_err(|e| AppError::Audio(format!("Failed to build input stream: {}", e)))?;
 
-    stream.play()
+    stream
+        .play()
         .map_err(|e| AppError::Audio(format!("Failed to start input stream: {}", e)))?;
 
     Ok(AudioInputHandle {
         stream,
         is_running,
-        sample_rate,
-        channels,
+        sample_rate: target_rate,
+        channels: 1,
     })
 }
 
@@ -100,45 +156,26 @@ pub fn create_output_stream() -> Result<AudioOutputHandle> {
             })();
 
             match res {
-                Ok((_stream, sink)) => {
-                    let (term_tx, term_rx) = std::sync::mpsc::channel::<()>();
-                    let _ = tx.send(Ok((sink, term_tx)));
-                    // Keep stream alive until term signal or channel drop
-                    let _ = term_rx.recv();
+                Ok((stream, sink)) => {
+                    let _ = tx.send(Ok(AudioOutputHandle { sink }));
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        let _ = &stream;
+                    }
                 }
-                Err(err_msg) => {
-                    let _ = tx.send(Err(err_msg));
+                Err(err) => {
+                    let _ = tx.send(Err(AppError::Audio(err)));
                 }
             }
         })
-        .map_err(|e| AppError::Audio(format!("Failed to spawn audio output thread: {}", e)))?;
+        .map_err(|e| AppError::Audio(format!("Failed to spawn rodio audio thread: {}", e)))?;
 
-    let res = rx.recv().map_err(|e| AppError::Audio(format!("Audio thread died: {}", e)))?;
-    match res {
-        Ok((sink, _term_tx)) => Ok(AudioOutputHandle { sink }),
-        Err(e) => Err(AppError::Audio(e)),
-    }
+    rx.recv()
+        .map_err(|e| AppError::Audio(format!("Rodio audio thread communication channel disconnected: {}", e)))?
 }
 
-impl AudioOutputHandle {
-    pub fn play_pcm_f32(&self, samples: Vec<f32>, sample_rate: u32, channels: u16) {
-        let buffer = SamplesBuffer::new(channels, sample_rate, samples);
-        self.sink.append(buffer);
-    }
-
-    pub fn stop(&self) {
-        self.sink.stop();
-    }
-
-    pub fn pause(&self) {
-        self.sink.pause();
-    }
-
-    pub fn resume(&self) {
-        self.sink.play();
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.sink.empty()
-    }
+pub fn play_samples(handle: &AudioOutputHandle, samples: &[f32], sample_rate: u32) {
+    let buf = SamplesBuffer::new(1, sample_rate, samples.to_vec());
+    handle.sink.append(buf);
+    handle.sink.play();
 }

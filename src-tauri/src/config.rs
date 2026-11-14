@@ -35,6 +35,15 @@ impl Default for HotkeyConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerDto {
+    pub id: String,
+    pub name: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub hardware_profile: HardwareProfile,
     pub local_llama_url: String,
@@ -47,6 +56,8 @@ pub struct AppConfig {
     pub models_dir: PathBuf,
     pub agents_dir: PathBuf,
     pub db_path: PathBuf,
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerDto>,
 }
 
 impl Default for AppConfig {
@@ -67,6 +78,7 @@ impl Default for AppConfig {
             agents_dir: base_dir.join("agents"),
             db_path: base_dir.join("data.db"),
             home_dir: base_dir,
+            mcp_servers: Vec::new(),
         }
     }
 }
@@ -77,6 +89,19 @@ impl AppConfig {
             .unwrap_or_else(|| PathBuf::from("."))
             .join(".heyclicky");
         base_dir.join("config.toml")
+    }
+
+    pub fn load_or_default(path: &std::path::Path) -> Result<Self> {
+        if !path.exists() {
+            let default_cfg = Self::default();
+            let _ = default_cfg.save();
+            return Ok(default_cfg);
+        }
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| AppError::Config(format!("Failed to read {}: {}", path.display(), e)))?;
+        let config: AppConfig = toml::from_str(&content)
+            .map_err(|e| AppError::Config(format!("Failed to parse TOML config: {}", e)))?;
+        Ok(config)
     }
 
     pub fn load() -> Result<Self> {
@@ -128,5 +153,32 @@ impl AppConfig {
         std::fs::create_dir_all(&self.agents_dir)
             .map_err(|e| AppError::Config(format!("Failed to create agents dir: {}", e)))?;
         Ok(())
+    }
+
+    pub fn list_mcp_servers(&self) -> Vec<McpServerDto> {
+        self.mcp_servers.clone()
+    }
+
+    pub fn upsert_mcp_server(&mut self, server: McpServerDto) {
+        self.mcp_servers.retain(|s| s.id != server.id);
+        self.mcp_servers.push(server);
+    }
+
+    pub fn remove_mcp_server(&mut self, id: &str) {
+        self.mcp_servers.retain(|s| s.id != id);
+    }
+
+    pub fn set_hotkey(&mut self, action: &str, key: &str) {
+        match action.to_lowercase().as_str() {
+            "talk" => self.hotkeys.talk = key.to_string(),
+            "dictation" => self.hotkeys.dictation = key.to_string(),
+            "pill" => self.hotkeys.pill = key.to_string(),
+            "quick_input" | "quickinput" => self.hotkeys.quick_input = key.to_string(),
+            _ => {}
+        }
+    }
+
+    pub fn set_active_model(&mut self, model: &str) {
+        self.local_model_name = Some(model.to_string());
     }
 }

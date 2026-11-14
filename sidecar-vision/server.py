@@ -108,6 +108,7 @@ async def health_check():
     }
 
 
+@app.post("/parse", response_model=ParseScreenResponse)
 @app.post("/parse_screen", response_model=ParseScreenResponse)
 async def parse_screen(request: ParseScreenRequest):
     """

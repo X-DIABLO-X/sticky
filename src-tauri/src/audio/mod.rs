@@ -16,6 +16,9 @@ use crate::audio::tts::KokoroTts;
 use crate::audio::vad::{VadState, VoiceActivityDetector};
 use crate::error::Result;
 
+const TARGET_SAMPLE_RATE: u32 = 16000;
+const CHUNK_30MS: usize = 480; // 30ms @ 16kHz mono
+
 pub struct AudioEngine {
     ring_consumer: Option<AudioRingConsumer>,
     input_handle: Option<AudioInputHandle>,
@@ -24,7 +27,7 @@ pub struct AudioEngine {
     _aec: AecProcessor,
     stt: SttService,
     tts: KokoroTts,
-    is_listening: bool,
+    pub is_listening: bool,
     recorded_buffer: Vec<f32>,
     pub mic_sample_rate: u32,
 }
@@ -46,8 +49,8 @@ impl AudioEngine {
             stt,
             tts,
             is_listening: false,
-            recorded_buffer: Vec::with_capacity(48000 * 30), // 30 sec buffer
-            mic_sample_rate: 44100,
+            recorded_buffer: Vec::with_capacity(TARGET_SAMPLE_RATE as usize * 30), // 30 sec buffer
+            mic_sample_rate: TARGET_SAMPLE_RATE,
         }
     }
 
@@ -82,11 +85,11 @@ impl AudioEngine {
         Ok(())
     }
 
-    pub fn stop_mic(&mut self) {
-        if let Some(ref handle) = self.input_handle {
-            handle.is_running.store(false, std::sync::atomic::Ordering::Relaxed);
-        }
-        self.input_handle = None;
+    pub fn start_listening(&mut self) -> Result<()> {
+        self.start_mic()
+    }
+
+    pub fn drain_remaining_frames(&mut self) {
         if let Some(ref mut consumer) = self.ring_consumer {
             let avail = consumer.slots_available();
             if avail > 0 {
@@ -95,8 +98,20 @@ impl AudioEngine {
                 self.recorded_buffer.extend_from_slice(&buf[..read]);
             }
         }
+    }
+
+    pub fn stop_mic(&mut self) {
+        if let Some(ref handle) = self.input_handle {
+            handle.is_running.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.drain_remaining_frames();
+        self.input_handle = None;
         self.ring_consumer = None;
         self.is_listening = false;
+    }
+
+    pub fn stop_listening(&mut self) {
+        self.stop_mic()
     }
 
     /// Read incoming PCM samples, compute RMS and run VAD across all available frames
@@ -105,8 +120,7 @@ impl AudioEngine {
         let mut last_state = None;
         let mut max_rms: f32 = 0.0;
 
-        let sample_rate = if self.mic_sample_rate > 0 { self.mic_sample_rate } else { 44100 };
-        let chunk_size = (sample_rate as usize * 30) / 1000; // 30ms chunk
+        let chunk_size = CHUNK_30MS;
 
         while consumer.slots_available() >= chunk_size {
             let mut chunk = vec![0.0f32; chunk_size];
@@ -139,9 +153,12 @@ impl AudioEngine {
     }
 
     pub async fn transcribe_recorded(&mut self) -> Result<String> {
+        self.drain_remaining_frames();
         let samples = std::mem::take(&mut self.recorded_buffer);
-        let sample_rate = if self.mic_sample_rate > 0 { self.mic_sample_rate } else { 44100 };
-        self.stt.transcribe(&samples, sample_rate).await
+        if samples.is_empty() {
+            return Ok(String::new());
+        }
+        self.stt.transcribe(&samples, TARGET_SAMPLE_RATE).await
     }
 
     pub async fn barge_in_flush(&mut self) {
@@ -149,6 +166,11 @@ impl AudioEngine {
         if let Some(ref mut c) = self.ring_consumer {
             c.flush();
         }
+    }
+
+    pub async fn speak(&mut self, text: &str) -> Result<()> {
+        self.push_tts_token(text).await?;
+        self.flush_tts().await
     }
 
     pub async fn push_tts_token(&mut self, token: &str) -> Result<()> {

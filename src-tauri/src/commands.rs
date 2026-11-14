@@ -1,10 +1,12 @@
+use std::collections::HashMap;
 use std::sync::Arc;
-use tauri::{AppHandle, State};
-use crate::ai::prompts::Prompts;
+use tauri::{AppHandle, Manager, State};
+
+use crate::ai::local_runner::{HardwareProfileDto, LocalModelSpec};
 use crate::ai::router::TaskType;
 use crate::ai::AgentRuntime;
-use crate::config::AppConfig;
-use crate::error::Result;
+use crate::config::{AppConfig, McpServerDto};
+use crate::error::{AppError, Result};
 use crate::storage::agents_repo::{AgentModel, CronJobModel};
 use crate::storage::memory::MemoryEntry;
 use crate::ui::windows::WindowManager;
@@ -21,6 +23,15 @@ pub async fn stop_talk(state: State<'_, AppState>) -> Result<()> {
 }
 
 #[tauri::command]
+pub async fn toggle_talk(active: bool, state: State<'_, AppState>) -> Result<()> {
+    if active {
+        state.talk_controller.start_talk().await
+    } else {
+        state.talk_controller.stop_talk().await
+    }
+}
+
+#[tauri::command]
 pub async fn start_dictation(state: State<'_, AppState>) -> Result<()> {
     state.dictation_controller.start_dictation().await
 }
@@ -29,167 +40,6 @@ pub async fn start_dictation(state: State<'_, AppState>) -> Result<()> {
 pub async fn stop_dictation(state: State<'_, AppState>) -> Result<String> {
     let hotwords = state.memory_repo.get_dictionary_hotwords().unwrap_or_default();
     state.dictation_controller.stop_dictation(hotwords).await
-}
-
-#[tauri::command]
-pub async fn confirm_drive(confirmed: bool, state: State<'_, AppState>) -> Result<()> {
-    state.drive_controller.set_confirmed(confirmed);
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn set_ignore_cursor_events(ignore: bool, app: AppHandle) -> Result<()> {
-    WindowManager::set_ignore_cursor_events(&app, "overlay", ignore)
-}
-
-#[tauri::command]
-pub async fn get_agents(state: State<'_, AppState>) -> Result<Vec<AgentModel>> {
-    state.agents_repo.get_agents()
-}
-
-#[tauri::command]
-pub async fn create_agent(
-    name: String,
-    role: String,
-    system_prompt: Option<String>,
-    workspace_path: Option<String>,
-    state: State<'_, AppState>,
-) -> Result<AgentModel> {
-    let cfg = state.config.read().await;
-    let ws = workspace_path.unwrap_or_else(|| {
-        cfg.agents_dir.join(&name).display().to_string()
-    });
-    let prompt = system_prompt.unwrap_or_else(|| Prompts::agent_routine_system_prompt(&name, &role));
-    state.agents_repo.create_agent(&name, &role, &prompt, &ws)
-}
-
-#[tauri::command]
-pub async fn get_cron_jobs(state: State<'_, AppState>) -> Result<Vec<CronJobModel>> {
-    state.agents_repo.get_cron_jobs()
-}
-
-#[tauri::command]
-pub async fn add_cron_job(
-    agent_id: String,
-    cron_expr: String,
-    prompt: String,
-    state: State<'_, AppState>,
-) -> Result<CronJobModel> {
-    let job = state.agents_repo.add_cron_job(&agent_id, &cron_expr, &prompt)?;
-    state.scheduler_service.add_cron_job(&cron_expr, &agent_id, &prompt).await?;
-    Ok(job)
-}
-
-#[tauri::command]
-pub async fn get_memories(scope: Option<String>, state: State<'_, AppState>) -> Result<Vec<MemoryEntry>> {
-    state.memory_repo.get_memories(scope.as_deref())
-}
-
-#[tauri::command]
-pub async fn save_memory(
-    scope: String,
-    key: String,
-    value: String,
-    state: State<'_, AppState>,
-) -> Result<MemoryEntry> {
-    state.memory_repo.save_memory(&scope, &key, &value)
-}
-
-#[tauri::command]
-pub async fn get_app_config(state: State<'_, AppState>) -> Result<AppConfig> {
-    let cfg = state.config.read().await;
-    Ok(cfg.clone())
-}
-
-#[tauri::command]
-pub async fn save_app_config(new_config: AppConfig, state: State<'_, AppState>) -> Result<()> {
-    new_config.save()?;
-    let mut cfg = state.config.write().await;
-    *cfg = new_config.clone();
-    drop(cfg);
-
-    let mut engine = state.audio_engine.lock().await;
-    engine.set_groq_api_key(new_config.groq_api_key.clone());
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn execute_prompt(
-    prompt: String,
-    agent_id: Option<String>,
-    state: State<'_, AppState>,
-) -> Result<String> {
-    let system_prompt = if let Some(ref id) = agent_id {
-        if let Ok(Some(agent)) = state.agents_repo.get_agent(id) {
-            agent.system_prompt
-        } else {
-            Prompts::talk_mode_system_prompt().to_string()
-        }
-    } else {
-        Prompts::talk_mode_system_prompt().to_string()
-    };
-
-    let tools_guard = state.tools.lock().await;
-    let mut runtime = AgentRuntime::with_system_prompt(
-        Arc::clone(&state.router),
-        Arc::new(tools_guard.clone()),
-        &system_prompt,
-    );
-    drop(tools_guard);
-
-    let answer = runtime.execute_turn(&prompt, TaskType::FastTalk, None).await?;
-
-    if let Some(ref id) = agent_id {
-        let _ = state.agents_repo.save_message(id, "user", &prompt);
-        let _ = state.agents_repo.save_message(id, "assistant", &answer);
-    }
-
-    Ok(answer)
-}
-
-#[tauri::command]
-pub async fn get_ollama_models(state: State<'_, AppState>) -> Result<Vec<String>> {
-    let cfg = state.config.read().await;
-    let provider = crate::ai::providers::local_llamacpp::LocalLlamaProvider::new(cfg.local_llama_url.clone());
-    provider.list_models().await
-}
-
-#[tauri::command]
-pub async fn check_ollama_status(state: State<'_, AppState>) -> Result<serde_json::Value> {
-    let cfg = state.config.read().await;
-    let provider = crate::ai::providers::local_llamacpp::LocalLlamaProvider::new(cfg.local_llama_url.clone());
-    let running = provider.check_health().await;
-    let models = if running {
-        provider.list_models().await.unwrap_or_default()
-    } else {
-        vec![]
-    };
-    let current_model = cfg.local_model_name.clone().unwrap_or_else(|| "bonsai-2:9b".to_string());
-    Ok(serde_json::json!({
-        "running": running,
-        "url": cfg.local_llama_url,
-        "models": models,
-        "current_model": current_model,
-    }))
-}
-
-#[tauri::command]
-pub async fn get_config(state: State<'_, AppState>) -> Result<AppConfig> {
-    get_app_config(state).await
-}
-
-#[tauri::command]
-pub async fn save_config(config: AppConfig, state: State<'_, AppState>) -> Result<()> {
-    save_app_config(config, state).await
-}
-
-#[tauri::command]
-pub async fn toggle_talk(active: bool, state: State<'_, AppState>) -> Result<()> {
-    if active {
-        state.talk_controller.start_talk().await
-    } else {
-        state.talk_controller.stop_talk().await
-    }
 }
 
 #[tauri::command]
@@ -204,83 +54,373 @@ pub async fn toggle_dictation(active: bool, state: State<'_, AppState>) -> Resul
 }
 
 #[tauri::command]
-pub async fn set_active_model(model_name: String, state: State<'_, AppState>) -> Result<()> {
-    let mut cfg = state.config.write().await;
-    cfg.local_model_name = Some(model_name);
-    let _ = cfg.save();
+pub async fn confirm_drive(confirmed: bool, state: State<'_, AppState>) -> Result<()> {
+    state.drive_controller.set_confirmed(confirmed);
     Ok(())
 }
 
 #[tauri::command]
+pub async fn stop_drive(state: State<'_, AppState>) -> Result<()> {
+    state.drive_controller.stop_drive();
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn set_ignore_cursor_events(ignore: bool, app: AppHandle) -> Result<()> {
+    if let Some(win) = app.get_webview_window("overlay") {
+        win.set_ignore_cursor_events(ignore)
+            .map_err(|e| AppError::Config(e.to_string()))?;
+    }
+    Ok(())
+}
+
+// ── Agents CRUD ──
+
+#[tauri::command]
+pub async fn get_agents(state: State<'_, AppState>) -> Result<Vec<AgentModel>> {
+    state.agents_repo.list_agents()
+}
+
+#[tauri::command]
+pub async fn list_agents(state: State<'_, AppState>) -> Result<Vec<AgentModel>> {
+    state.agents_repo.list_agents()
+}
+
+#[tauri::command]
+pub async fn create_agent(
+    name: String,
+    role: String,
+    #[allow(non_snake_case)] systemPrompt: Option<String>,
+    system_prompt: Option<String>,
+    #[allow(non_snake_case)] workspacePath: Option<String>,
+    workspace_path: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<AgentModel> {
+    let prompt = system_prompt.or(systemPrompt).unwrap_or_else(|| "You are a helpful desktop AI agent.".to_string());
+    let path = workspace_path.or(workspacePath).unwrap_or_else(|| "D:\\cliky".to_string());
+    state.agents_repo.create_agent(&name, &role, &prompt, &path)
+}
+
+#[tauri::command]
+pub async fn save_agent(agent: AgentModel, state: State<'_, AppState>) -> Result<AgentModel> {
+    state.agents_repo.upsert_agent(&agent)
+}
+
+#[tauri::command]
+pub async fn delete_agent(
+    #[allow(non_snake_case)] agentId: Option<String>,
+    id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<()> {
+    let target = id.or(agentId).unwrap_or_default();
+    state.agents_repo.delete_agent(&target)
+}
+
+#[tauri::command]
+pub async fn toggle_agent(
+    #[allow(non_snake_case)] agentId: Option<String>,
+    id: Option<String>,
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<()> {
+    let target = id.or(agentId).unwrap_or_default();
+    state.agents_repo.set_agent_enabled(&target, enabled)
+}
+
+// ── Cron Jobs CRUD ──
+
+#[tauri::command]
+pub async fn get_cron_jobs(state: State<'_, AppState>) -> Result<Vec<CronJobModel>> {
+    state.agents_repo.list_cron_jobs()
+}
+
+#[tauri::command]
+pub async fn add_cron_job(
+    #[allow(non_snake_case)] agentId: Option<String>,
+    agent_id: Option<String>,
+    #[allow(non_snake_case)] cronExpr: Option<String>,
+    cron_expr: Option<String>,
+    prompt: String,
+    state: State<'_, AppState>,
+) -> Result<CronJobModel> {
+    let a_id = agent_id.or(agentId).unwrap_or_else(|| "default".to_string());
+    let expr = cron_expr.or(cronExpr).unwrap_or_else(|| "0 9 * * *".to_string());
+    state.agents_repo.create_cron_job(&a_id, &expr, &prompt)
+}
+
+#[tauri::command]
+pub async fn save_cron_job(job: CronJobModel, state: State<'_, AppState>) -> Result<CronJobModel> {
+    state.agents_repo.upsert_cron_job(&job)
+}
+
+#[tauri::command]
+pub async fn delete_cron_job(
+    #[allow(non_snake_case)] jobId: Option<String>,
+    id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<()> {
+    let target = id.or(jobId).unwrap_or_default();
+    state.agents_repo.delete_cron_job(&target)
+}
+
+#[tauri::command]
+pub async fn toggle_cron_job(
+    #[allow(non_snake_case)] jobId: Option<String>,
+    id: Option<String>,
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<()> {
+    let target = id.or(jobId).unwrap_or_default();
+    state.agents_repo.set_cron_job_enabled(&target, enabled)
+}
+
+// ── Memory CRUD ──
+
+#[tauri::command]
+pub async fn get_memories(
+    scope: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<MemoryEntry>> {
+    state.memory_repo.list_memories(scope.as_deref())
+}
+
+#[tauri::command]
+pub async fn save_memory(
+    scope: String,
+    key: String,
+    value: String,
+    state: State<'_, AppState>,
+) -> Result<MemoryEntry> {
+    state.memory_repo.upsert_memory(&scope, &key, &value)
+}
+
+#[tauri::command]
+pub async fn clear_memory(state: State<'_, AppState>) -> Result<()> {
+    state.memory_repo.clear_all()
+}
+
+// ── Config & Hotkeys ──
+
+#[tauri::command]
+pub async fn get_app_config(state: State<'_, AppState>) -> Result<AppConfig> {
+    let cfg = state.config.read().await;
+    Ok(cfg.clone())
+}
+
+#[tauri::command]
+pub async fn save_app_config(new_config: AppConfig, state: State<'_, AppState>) -> Result<()> {
+    let mut cfg = state.config.write().await;
+    *cfg = new_config;
+    cfg.save()
+}
+
+#[tauri::command]
+pub async fn get_config(state: State<'_, AppState>) -> Result<AppConfig> {
+    let cfg = state.config.read().await;
+    Ok(cfg.clone())
+}
+
+#[tauri::command]
+pub async fn save_config(config: AppConfig, state: State<'_, AppState>) -> Result<()> {
+    let mut cfg = state.config.write().await;
+    *cfg = config;
+    cfg.save()
+}
+
+#[tauri::command]
+pub async fn register_hotkey(
+    hotkey: String,
+    action: String,
+    state: State<'_, AppState>,
+) -> Result<()> {
+    let mut cfg = state.config.write().await;
+    cfg.set_hotkey(&action, &hotkey);
+    cfg.save()
+}
+
+#[tauri::command]
+pub async fn update_hotkeys(
+    hotkeys: HashMap<String, String>,
+    state: State<'_, AppState>,
+) -> Result<()> {
+    let mut cfg = state.config.write().await;
+    for (action, key) in hotkeys {
+        cfg.set_hotkey(&action, &key);
+    }
+    cfg.save()
+}
+
+// ── MCP Servers ──
+
+#[tauri::command]
+pub async fn get_mcp_servers(state: State<'_, AppState>) -> Result<Vec<McpServerDto>> {
+    let cfg = state.config.read().await;
+    Ok(cfg.list_mcp_servers())
+}
+
+#[tauri::command]
+pub async fn save_mcp_server(server: McpServerDto, state: State<'_, AppState>) -> Result<()> {
+    let mut cfg = state.config.write().await;
+    cfg.upsert_mcp_server(server);
+    cfg.save()
+}
+
+#[tauri::command]
+pub async fn delete_mcp_server(id: String, state: State<'_, AppState>) -> Result<()> {
+    let mut cfg = state.config.write().await;
+    cfg.remove_mcp_server(&id);
+    cfg.save()
+}
+
+// ── Prompt Execution & Ollama / Local Models ──
+
+#[tauri::command]
+pub async fn execute_prompt(
+    prompt: String,
+    #[allow(non_snake_case)] agentId: Option<String>,
+    agent_id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<String> {
+    let resolved_agent_id = agent_id.or(agentId);
+    let system_prompt = if let Some(id) = resolved_agent_id {
+        state
+            .agents_repo
+            .list_agents()?
+            .into_iter()
+            .find(|a| a.id == id)
+            .map(|a| a.system_prompt)
+            .unwrap_or_else(|| "You are Sticky, a helpful desktop AI assistant.".to_string())
+    } else {
+        "You are Sticky, a helpful desktop AI assistant.".to_string()
+    };
+
+    let tool_registry = {
+        let guard = state.tools.lock().await;
+        Arc::new(guard.clone())
+    };
+
+    let mut runtime = AgentRuntime::with_system_prompt(
+        state.router.clone(),
+        tool_registry,
+        &system_prompt,
+    );
+    runtime.execute_turn(&prompt, TaskType::FastTalk, None).await
+}
+
+#[tauri::command]
+pub async fn execute_agent_task(
+    #[allow(non_snake_case)] agentId: Option<String>,
+    agent_id: Option<String>,
+    input: Option<String>,
+    prompt: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<String> {
+    let p = input.or(prompt).unwrap_or_default();
+    execute_prompt(p, agentId, agent_id, state).await
+}
+
+#[tauri::command]
+pub async fn get_ollama_models(_state: State<'_, AppState>) -> Result<Vec<String>> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .map_err(|e| AppError::Network(e.to_string()))?;
+
+    let resp = match client.get("http://127.0.0.1:11434/api/tags").send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return Ok(vec![]),
+    };
+
+    let json: serde_json::Value = resp.json().await.unwrap_or_default();
+    let models = json["models"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m["name"].as_str().map(ToString::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(models)
+}
+
+#[tauri::command]
+pub async fn check_ollama_status(state: State<'_, AppState>) -> Result<serde_json::Value> {
+    let models = get_ollama_models(state).await.unwrap_or_default();
+    Ok(serde_json::json!({
+        "running": !models.is_empty(),
+        "models": models,
+    }))
+}
+
+#[tauri::command]
+pub async fn set_active_model(
+    #[allow(non_snake_case)] modelName: Option<String>,
+    model_name: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<()> {
+    let chosen = model_name.or(modelName).unwrap_or_default();
+    if chosen.is_empty() {
+        return Err(AppError::Config("Model name cannot be empty".to_string()));
+    }
+    let mut cfg = state.config.write().await;
+    cfg.set_active_model(&chosen);
+    cfg.save()
+}
+
+// ── Window Management Helpers ──
+
+#[tauri::command]
 pub async fn open_dashboard(app: AppHandle) -> Result<()> {
-    WindowManager::show(&app, "dashboard")
+    if WindowManager::show(&app, "dashboard").is_err() {
+        let _ = WindowManager::show(&app, "main");
+    }
+    Ok(())
 }
 
 #[tauri::command]
 pub async fn toggle_dashboard(app: AppHandle) -> Result<bool> {
-    WindowManager::toggle(&app, "dashboard")
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct HardwareProfileDto {
-    pub os: String,
-    pub arch: String,
-    pub cpu_cores: usize,
-    pub recommended_profile: String,
-    pub sidecar_running: bool,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct LocalModelDto {
-    pub id: String,
-    pub name: String,
-    pub kind: String,
-    pub installed: bool,
-    pub path: Option<String>,
+    match WindowManager::toggle(&app, "dashboard") {
+        Ok(res) => Ok(res),
+        Err(_) => WindowManager::toggle(&app, "main"),
+    }
 }
 
 #[tauri::command]
-pub async fn get_hardware_profile(_state: State<'_, AppState>) -> Result<HardwareProfileDto> {
-    let cpu_cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-
-    Ok(HardwareProfileDto {
-        os: std::env::consts::OS.to_string(),
-        arch: std::env::consts::ARCH.to_string(),
-        cpu_cores,
-        recommended_profile: "bonsai-2:9b (Ollama local)".to_string(),
-        sidecar_running: false,
-    })
+pub async fn hide_bubble(app: AppHandle) -> Result<()> {
+    WindowManager::hide(&app, "bubble")
 }
 
 #[tauri::command]
-pub async fn get_local_models() -> Result<Vec<LocalModelDto>> {
-    let base_dir = dirs::home_dir().unwrap_or_default().join(".heyclicky").join("models");
-    let catalog = vec![
-        ("bonsai-2:9b", "Bonsai-2 9B (Local Ollama)", "llm"),
-        ("whisper-tiny.en", "Faster-Whisper Tiny.EN", "stt"),
-        ("kokoro-v1.0.onnx", "Kokoro-82M ONNX", "tts"),
-        ("silero_vad.onnx", "Silero VAD v5", "vad"),
-    ];
-
-    Ok(catalog
-        .into_iter()
-        .map(|(id, name, kind)| {
-            let p = base_dir.join(id);
-            let installed = p.exists() || id.contains("bonsai") || id.contains("whisper");
-            LocalModelDto {
-                id: id.to_string(),
-                name: name.to_string(),
-                kind: kind.to_string(),
-                installed,
-                path: if installed { Some(p.to_string_lossy().to_string()) } else { None },
-            }
-        })
-        .collect())
+pub async fn hide_quick_input(app: AppHandle) -> Result<()> {
+    WindowManager::hide(&app, "quick_input")
 }
 
 #[tauri::command]
-pub async fn download_local_model(model_name: String) -> Result<String> {
-    Ok(format!("Model {} verified", model_name))
+pub async fn close_quick_input(app: AppHandle) -> Result<()> {
+    WindowManager::hide(&app, "quick_input")
+}
+
+// ── Local Hardware & Model Runner Commands ──
+
+#[tauri::command]
+pub async fn get_hardware_profile() -> Result<HardwareProfileDto> {
+    Ok(crate::ai::local_runner::detect_hardware_profile())
+}
+
+#[tauri::command]
+pub async fn get_local_models() -> Result<Vec<LocalModelSpec>> {
+    Ok(crate::ai::local_runner::get_available_models())
+}
+
+#[tauri::command]
+pub async fn download_local_model(
+    #[allow(non_snake_case)] modelName: Option<String>,
+    model_id: Option<String>,
+    app_handle: AppHandle,
+) -> Result<String> {
+    let target = model_id
+        .or(modelName)
+        .ok_or_else(|| AppError::Config("Missing model identifier".to_string()))?;
+
+    crate::ai::local_runner::download_model_weights(&target, &app_handle).await
 }

@@ -31,6 +31,8 @@ pub struct TalkController {
     router: Arc<ModelRouter>,
     current_state: Arc<Mutex<TalkState>>,
     cancel_flag: Arc<AtomicBool>,
+    /// Serializes start_talk and stop_talk so rapid hotkey taps never race
+    op_lock: Arc<Mutex<()>>,
 }
 
 fn broadcast_overlay_command(app: &AppHandle, cmd: &OverlayCommand) {
@@ -91,6 +93,7 @@ impl TalkController {
             router,
             current_state: Arc::new(Mutex::new(TalkState::Idle)),
             cancel_flag: Arc::new(AtomicBool::new(false)),
+            op_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -98,11 +101,35 @@ impl TalkController {
         *self.current_state.lock().await
     }
 
+    fn emit_talk_state(app: &AppHandle, state: TalkState) {
+        let str_state = match state {
+            TalkState::Idle => "idle",
+            TalkState::Listening => "listening",
+            TalkState::Transcribing => "transcribing",
+            TalkState::Thinking => "thinking",
+            TalkState::Speaking => "speaking",
+        };
+        let _ = app.emit("talk:state", str_state);
+        let _ = app.emit("talk_state", str_state);
+        let _ = app.emit("talk_state_changed", str_state);
+    }
+
+    fn emit_transcript(app: &AppHandle, text: &str) {
+        let _ = app.emit("talk:transcript", text);
+        let _ = app.emit("talk_text", text);
+        let _ = app.emit("transcript_chunk", serde_json::json!({
+            "text": text,
+            "speaker": "user",
+            "audioActive": false
+        }));
+    }
+
     pub async fn start_talk(&self) -> Result<()> {
+        let _guard = self.op_lock.lock().await;
+
         {
             let state = self.current_state.lock().await;
             if *state == TalkState::Speaking {
-                // Barge in on assistant if currently speaking
                 drop(state);
                 self.barge_in().await;
             } else if *state != TalkState::Idle {
@@ -116,7 +143,9 @@ impl TalkController {
 
             self.cancel_flag.store(false, Ordering::SeqCst);
             *state = TalkState::Listening;
-            let _ = self.app_handle.emit("talk:state", TalkState::Listening);
+            Self::emit_talk_state(&self.app_handle, TalkState::Listening);
+            let _ = self.app_handle.emit("cursor:ptt_start", ());
+            let _ = self.app_handle.emit("hotkey:talk_down", ());
             let _ = self.app_handle.emit("transcript_chunk", serde_json::json!({
                 "text": "Listening...",
                 "speaker": "user",
@@ -126,7 +155,13 @@ impl TalkController {
 
         {
             let mut engine = self.audio_engine.lock().await;
-            engine.start_mic()?;
+            if let Err(e) = engine.start_mic() {
+                eprintln!("[Talk] Failed to start microphone: {e}");
+                let mut state = self.current_state.lock().await;
+                *state = TalkState::Idle;
+                Self::emit_talk_state(&self.app_handle, TalkState::Idle);
+                return Err(e);
+            }
         }
 
         // Spawn real-time audio polling, AEC processing, and VAD silence timeout loop
@@ -140,9 +175,9 @@ impl TalkController {
             let mut silence_start: Option<std::time::Instant> = None;
             let start_time = std::time::Instant::now();
 
-            let initial_silence_timeout = Duration::from_millis(4500); // 4.5s without speech -> auto cancel
-            let trailing_silence_timeout = Duration::from_millis(1200); // 1.2s silence after speech -> auto submit
-            let max_utterance_timeout = Duration::from_millis(25000);   // 25s max listening cap
+            let initial_silence_timeout = Duration::from_millis(5000); // 5s without speech -> auto cancel
+            let trailing_silence_timeout = Duration::from_millis(1400); // 1.4s silence after speech -> auto submit
+            let max_utterance_timeout = Duration::from_millis(30000);   // 30s max cap
 
             loop {
                 interval.tick().await;
@@ -164,8 +199,8 @@ impl TalkController {
                 let elapsed = start_time.elapsed();
 
                 if let Some((vad_state, rms)) = tick_res {
-                    // Emit audio amplitude for live waveform visuals
                     let _ = app_handle_clone.emit("audio_amplitude", rms);
+                    let _ = app_handle_clone.emit("audio:rms", rms);
 
                     match vad_state {
                         VadState::SpeechStarted | VadState::Speaking => {
@@ -187,26 +222,22 @@ impl TalkController {
                     }
                 }
 
-                // Check trailing silence timeout after user has spoken
                 let trailing_silence_hit = if speech_detected {
                     silence_start.map(|s| s.elapsed() >= trailing_silence_timeout).unwrap_or(false)
                 } else {
                     false
                 };
 
-                // Check initial silence timeout (user triggered talk but said nothing)
                 let initial_silence_hit = !speech_detected && elapsed >= initial_silence_timeout;
-
-                // Check max utterance duration cap
                 let max_duration_hit = elapsed >= max_utterance_timeout;
 
                 if trailing_silence_hit || initial_silence_hit || max_duration_hit {
                     if trailing_silence_hit {
-                        eprintln!("[TalkController] Trailing silence ({}ms after speech) detected. Stopping and submitting.", trailing_silence_timeout.as_millis());
+                        eprintln!("[TalkController] Trailing silence detected. Submitting speech...");
                     } else if initial_silence_hit {
-                        eprintln!("[TalkController] Initial silence timeout ({}s) reached. Aborting talk.", initial_silence_timeout.as_secs());
+                        eprintln!("[TalkController] Initial silence timeout. Aborting talk.");
                     } else if max_duration_hit {
-                        eprintln!("[TalkController] Max utterance duration ({}s) reached. Stopping and submitting.", max_utterance_timeout.as_secs());
+                        eprintln!("[TalkController] Max utterance duration reached. Submitting speech...");
                     }
 
                     if let Some(app_state) = app_handle_clone.try_state::<AppState>() {
@@ -222,13 +253,17 @@ impl TalkController {
     }
 
     pub async fn stop_talk(&self) -> Result<()> {
+        let _guard = self.op_lock.lock().await;
+
         {
             let mut state = self.current_state.lock().await;
             if *state != TalkState::Listening {
                 return Ok(());
             }
             *state = TalkState::Transcribing;
-            let _ = self.app_handle.emit("talk:state", TalkState::Transcribing);
+            Self::emit_talk_state(&self.app_handle, TalkState::Transcribing);
+            let _ = self.app_handle.emit("cursor:ptt_stop", ());
+            let _ = self.app_handle.emit("hotkey:talk_up", ());
             let _ = self.app_handle.emit("transcript_chunk", serde_json::json!({
                 "text": "Transcribing speech...",
                 "speaker": "user",
@@ -236,18 +271,24 @@ impl TalkController {
             }));
         }
 
-        println!("[Talk] Transcribing audio buffer...");
-        let mut engine = self.audio_engine.lock().await;
-        engine.stop_mic();
-        let raw_transcript = engine.transcribe_recorded().await?;
-        drop(engine);
+        let raw_transcript = {
+            let mut engine = self.audio_engine.lock().await;
+            engine.stop_mic();
+            match engine.transcribe_recorded().await {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("[Talk] STT Transcription error: {e}");
+                    String::new()
+                }
+            }
+        };
 
         let transcript = raw_transcript.trim().to_string();
         if transcript.is_empty() {
-            println!("[Speech Text]: (No speech detected in audio)");
+            println!("\n[Speech Text]: (No speech detected in audio)");
             let mut state = self.current_state.lock().await;
             *state = TalkState::Idle;
-            let _ = self.app_handle.emit("talk:state", TalkState::Idle);
+            Self::emit_talk_state(&self.app_handle, TalkState::Idle);
             let _ = WindowManager::hide(&self.app_handle, "bubble");
             return Ok(());
         }
@@ -256,18 +297,13 @@ impl TalkController {
         println!("[Speech Text]: \"{}\"", transcript);
         println!("=======================================================\n");
 
-        let _ = self.app_handle.emit("talk:transcript", &transcript);
-        let _ = self.app_handle.emit("transcript_chunk", serde_json::json!({
-            "text": transcript,
-            "speaker": "user",
-            "audioActive": false
-        }));
+        Self::emit_transcript(&self.app_handle, &transcript);
 
         // Transition to Thinking
         {
             let mut state = self.current_state.lock().await;
             *state = TalkState::Thinking;
-            let _ = self.app_handle.emit("talk:state", TalkState::Thinking);
+            Self::emit_talk_state(&self.app_handle, TalkState::Thinking);
             let _ = self.app_handle.emit("transcript_chunk", serde_json::json!({
                 "text": "Thinking...",
                 "speaker": "clicky",
@@ -304,13 +340,25 @@ impl TalkController {
             chat_message,
         ];
 
-        let mut rx = self.router.route_and_stream(TaskType::FastTalk, &messages, &[]).await?;
+        let rx_result = self.router.route_and_stream(TaskType::FastTalk, &messages, &[]).await;
+
+        let mut rx = match rx_result {
+            Ok(receiver) => receiver,
+            Err(e) => {
+                eprintln!("[Talk] LLM routing error: {e}");
+                let mut state = self.current_state.lock().await;
+                *state = TalkState::Idle;
+                Self::emit_talk_state(&self.app_handle, TalkState::Idle);
+                let _ = WindowManager::hide(&self.app_handle, "bubble");
+                return Ok(());
+            }
+        };
 
         // Transition to Speaking
         {
             let mut state = self.current_state.lock().await;
             *state = TalkState::Speaking;
-            let _ = self.app_handle.emit("talk:state", TalkState::Speaking);
+            Self::emit_talk_state(&self.app_handle, TalkState::Speaking);
         }
 
         let mut parser = TagStreamParser::new();
@@ -330,12 +378,10 @@ impl TalkController {
                     if let Some(text) = chunk.delta_text {
                         let (clean_text, commands) = parser.feed_token(&text);
 
-                        // Emit visual overlay commands
                         for cmd in commands {
                             broadcast_overlay_command(&app, &cmd);
                         }
 
-                        // Stream clean speech to TTS and update bubble caption
                         if !clean_text.is_empty() {
                             full_assistant_response.push_str(&clean_text);
                             let _ = app.emit("transcript_chunk", serde_json::json!({
@@ -343,6 +389,7 @@ impl TalkController {
                                 "speaker": "clicky",
                                 "audioActive": true
                             }));
+                            let _ = app.emit("bubble_update", &full_assistant_response);
                             let mut eng = audio_engine.lock().await;
                             let _ = eng.push_tts_token(&clean_text).await;
                         }
@@ -367,13 +414,15 @@ impl TalkController {
                 "speaker": "clicky",
                 "audioActive": false
             }));
+            let _ = app.emit("bubble_update", &full_assistant_response);
             let mut eng = audio_engine.lock().await;
             let _ = eng.push_tts_token(&final_clean).await;
         }
 
-        let mut eng = audio_engine.lock().await;
-        let _ = eng.flush_tts().await;
-        drop(eng);
+        {
+            let mut eng = audio_engine.lock().await;
+            let _ = eng.flush_tts().await;
+        }
 
         if !full_assistant_response.is_empty() {
             println!("\n[Clicky AI Response]: \"{}\"", full_assistant_response);
@@ -382,8 +431,7 @@ impl TalkController {
 
         let mut state = self.current_state.lock().await;
         *state = TalkState::Idle;
-        let _ = self.app_handle.emit("talk:state", TalkState::Idle);
-        let _ = WindowManager::hide(&self.app_handle, "bubble");
+        Self::emit_talk_state(&self.app_handle, TalkState::Idle);
 
         Ok(())
     }
@@ -395,7 +443,7 @@ impl TalkController {
 
         let mut state = self.current_state.lock().await;
         *state = TalkState::Idle;
-        let _ = self.app_handle.emit("talk:state", TalkState::Idle);
+        Self::emit_talk_state(&self.app_handle, TalkState::Idle);
         let _ = WindowManager::hide(&self.app_handle, "bubble");
     }
 }

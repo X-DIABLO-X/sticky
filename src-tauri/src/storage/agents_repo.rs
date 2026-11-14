@@ -260,4 +260,96 @@ impl AgentsRepository {
 
         Ok(jobs)
     }
+
+    pub fn list_agents(&self) -> Result<Vec<AgentModel>> {
+        self.get_agents()
+    }
+
+    pub fn upsert_agent(&self, agent: &AgentModel) -> Result<AgentModel> {
+        let conn = self.db.conn();
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            r#"
+            INSERT INTO agents (id, name, role, system_prompt, workspace_path, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                role = excluded.role,
+                system_prompt = excluded.system_prompt,
+                workspace_path = excluded.workspace_path
+            "#,
+            params![
+                agent.id,
+                agent.name,
+                agent.role,
+                agent.system_prompt,
+                agent.workspace_path,
+                if agent.created_at.is_empty() { now } else { agent.created_at.clone() }
+            ],
+        )
+        .map_err(|e| AppError::Storage(format!("Failed to upsert agent: {e}")))?;
+        Ok(agent.clone())
+    }
+
+    pub fn delete_agent(&self, id: &str) -> Result<()> {
+        let conn = self.db.conn();
+        conn.execute("DELETE FROM agents WHERE id = ?1", params![id])
+            .map_err(|e| AppError::Storage(format!("Failed to delete agent: {e}")))?;
+        Ok(())
+    }
+
+    pub fn set_agent_enabled(&self, _id: &str, _enabled: bool) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn list_cron_jobs(&self) -> Result<Vec<CronJobModel>> {
+        self.get_cron_jobs()
+    }
+
+    pub fn create_cron_job(&self, agent_id: &str, cron_expr: &str, prompt: &str) -> Result<CronJobModel> {
+        self.add_cron_job(agent_id, cron_expr, prompt)
+    }
+
+    pub fn upsert_cron_job(&self, job: &CronJobModel) -> Result<CronJobModel> {
+        let conn = self.db.conn();
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            r#"
+            INSERT INTO cron_jobs (id, agent_id, cron_expr, prompt, is_active, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ON CONFLICT(id) DO UPDATE SET
+                agent_id = excluded.agent_id,
+                cron_expr = excluded.cron_expr,
+                prompt = excluded.prompt,
+                is_active = excluded.is_active
+            "#,
+            params![
+                job.id,
+                job.agent_id,
+                job.cron_expr,
+                job.prompt,
+                if job.is_active { 1 } else { 0 },
+                if job.created_at.is_empty() { now } else { job.created_at.clone() }
+            ],
+        )
+        .map_err(|e| AppError::Storage(format!("Failed to upsert cron job: {e}")))?;
+        Ok(job.clone())
+    }
+
+    pub fn delete_cron_job(&self, id: &str) -> Result<()> {
+        let conn = self.db.conn();
+        conn.execute("DELETE FROM cron_jobs WHERE id = ?1", params![id])
+            .map_err(|e| AppError::Storage(format!("Failed to delete cron job: {e}")))?;
+        Ok(())
+    }
+
+    pub fn set_cron_job_enabled(&self, id: &str, enabled: bool) -> Result<()> {
+        let conn = self.db.conn();
+        conn.execute(
+            "UPDATE cron_jobs SET is_active = ?1 WHERE id = ?2",
+            params![if enabled { 1 } else { 0 }, id],
+        )
+        .map_err(|e| AppError::Storage(format!("Failed to set cron job enabled: {e}")))?;
+        Ok(())
+    }
 }
