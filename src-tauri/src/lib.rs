@@ -51,12 +51,52 @@ pub struct AppState {
     pub scheduler_service: Arc<SchedulerService>,
 }
 
+static IS_QUITTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn run() {
+    // ── Single-instance guard ──────────────────────────────────────────────
+    // WebView2 locks its user-data directory; if another HeyClicky is already
+    // running, creating a second WebView will panic with HRESULT 0x800700AA
+    // ("The requested resource is in use."). We detect this early via a named
+    // mutex and exit gracefully instead of crashing.
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::Threading::CreateMutexW;
+        use windows::core::w;
+
+        let _mutex: HANDLE = unsafe {
+            CreateMutexW(None, false, w!("Global\\HeyClicky_SingleInstance_Guard"))
+                .unwrap_or_default()
+        };
+
+        if _mutex.is_invalid() || unsafe { windows::Win32::Foundation::GetLastError() } == windows::Win32::Foundation::ERROR_ALREADY_EXISTS {
+            let log_fn = || {
+                let p = dirs::home_dir().unwrap_or_default().join(".heyclicky").join("app.log");
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+                    use std::io::Write;
+                    let _ = writeln!(f, "[{}] Another HeyClicky instance is already running. Exiting gracefully.", chrono::Local::now());
+                }
+            };
+            log_fn();
+            eprintln!("[HeyClicky] Another instance is already running. Exiting.");
+            return;
+        }
+
+        // Keep the mutex handle alive for the process lifetime by storing it in a
+        // static. Windows auto-releases the named mutex when the process exits.
+        static INSTANCE_MUTEX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        INSTANCE_MUTEX.get_or_init(|| _mutex.0 as usize);
+    }
+
     if let Some(h) = dirs::home_dir() {
         let dir = h.join(".heyclicky");
         let _ = std::fs::create_dir_all(&dir);
         let log_path = dir.join("app.log");
-        let _ = std::fs::write(&log_path, format!("[{}] Starting HeyClicky...\n", chrono::Local::now()));
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+            use std::io::Write;
+            let _ = writeln!(f, "\n[{}] Starting HeyClicky...", chrono::Local::now());
+        }
     }
 
     std::panic::set_hook(Box::new(|info| {
@@ -83,7 +123,7 @@ pub fn run() {
         })
         .build();
 
-    tauri::Builder::default()
+    let build_result = tauri::Builder::default()
         .plugin(shortcut_builder)
         .setup(|app| {
             let log = |m: &str| {
@@ -109,7 +149,8 @@ pub fn run() {
             // Initialize Audio Engine
             log("Setup: initializing audio engine");
             let mut audio_engine = AudioEngine::new(config.groq_api_key.clone());
-            let _ = audio_engine.init_output();
+            // init_output spawns a dedicated thread for rodio, safe to block_on here during setup
+            let _ = tauri::async_runtime::block_on(audio_engine.init_output());
             let audio_engine_arc = Arc::new(Mutex::new(audio_engine));
 
             // Initialize Prewarmer
@@ -175,6 +216,7 @@ pub fn run() {
                 .on_menu_event(|app, event| {
                     match event.id.as_ref() {
                         "quit" => {
+                            IS_QUITTING.store(true, std::sync::atomic::Ordering::SeqCst);
                             app.exit(0);
                         }
                         "toggle_dashboard" => {
@@ -279,42 +321,65 @@ pub fn run() {
             commands::get_local_models,
             commands::download_local_model,
         ])
-        .build(tauri::generate_context!())
-        .expect("error while building heyclicky application")
-        .run(|app_handle, event| {
-            match event {
-                tauri::RunEvent::ExitRequested { api, .. } => {
-                    let p = dirs::home_dir().unwrap_or_default().join(".heyclicky").join("app.log");
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
-                        use std::io::Write;
-                        let _ = writeln!(f, "[{}] ExitRequested event received! Preventing exit to keep background pill & overlay running.", chrono::Local::now());
-                    }
-                    api.prevent_exit();
-                }
-                tauri::RunEvent::WindowEvent { label, event, .. } => {
-                    match event {
-                        tauri::WindowEvent::CloseRequested { api, .. } => {
+        .build(tauri::generate_context!());
+
+    match build_result {
+        Ok(app) => {
+            app.run(|app_handle, event| {
+                match event {
+                    tauri::RunEvent::ExitRequested { api, .. } => {
+                        if IS_QUITTING.load(std::sync::atomic::Ordering::SeqCst) {
                             let p = dirs::home_dir().unwrap_or_default().join(".heyclicky").join("app.log");
                             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
                                 use std::io::Write;
-                                let _ = writeln!(f, "[{}] CloseRequested for '{}' - hiding window instead of destroying", chrono::Local::now(), label);
+                                let _ = writeln!(f, "[{}] Quit confirmed. Releasing resources and shutting down.", chrono::Local::now());
                             }
-                            api.prevent_close();
-                            if let Some(win) = app_handle.get_webview_window(&label) {
-                                let _ = win.hide();
-                            }
-                        }
-                        tauri::WindowEvent::Destroyed => {
+                        } else {
                             let p = dirs::home_dir().unwrap_or_default().join(".heyclicky").join("app.log");
                             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
                                 use std::io::Write;
-                                let _ = writeln!(f, "[{}] Window '{}' was destroyed!", chrono::Local::now(), label);
+                                let _ = writeln!(f, "[{}] ExitRequested event received! Preventing exit to keep background pill & overlay running.", chrono::Local::now());
                             }
+                            api.prevent_exit();
                         }
-                        _ => {}
                     }
+                    tauri::RunEvent::WindowEvent { label, event, .. } => {
+                        match event {
+                            tauri::WindowEvent::CloseRequested { api, .. } => {
+                                let p = dirs::home_dir().unwrap_or_default().join(".heyclicky").join("app.log");
+                                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+                                    use std::io::Write;
+                                    let _ = writeln!(f, "[{}] CloseRequested for '{}' - hiding window instead of destroying", chrono::Local::now(), label);
+                                }
+                                api.prevent_close();
+                                if let Some(win) = app_handle.get_webview_window(&label) {
+                                    let _ = win.hide();
+                                }
+                            }
+                            tauri::WindowEvent::Destroyed => {
+                                let p = dirs::home_dir().unwrap_or_default().join(".heyclicky").join("app.log");
+                                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+                                    use std::io::Write;
+                                    let _ = writeln!(f, "[{}] Window '{}' was destroyed!", chrono::Local::now(), label);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
+            });
+        }
+        Err(e) => {
+            let crash_msg = format!("[{}] FATAL: Failed to build Tauri application: {}\n", chrono::Local::now(), e);
+            let crash_path = dirs::home_dir().unwrap_or_default().join(".heyclicky").join("crash.log");
+            let _ = std::fs::write(&crash_path, &crash_msg);
+            let log_path = dirs::home_dir().unwrap_or_default().join(".heyclicky").join("app.log");
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log_path) {
+                use std::io::Write;
+                let _ = write!(f, "{}", crash_msg);
             }
-        });
+            eprintln!("{}", crash_msg);
+        }
+    }
 }
