@@ -21,7 +21,7 @@ pub struct VoiceActivityDetector {
 
 impl Default for VoiceActivityDetector {
     fn default() -> Self {
-        Self::new(0.008, Duration::from_millis(300))
+        Self::new(0.004, Duration::from_millis(350))
     }
 }
 

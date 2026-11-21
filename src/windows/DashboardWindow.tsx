@@ -175,10 +175,13 @@ export const DashboardWindow: React.FC = () => {
   }, []);
 
   const handleSaveConfig = async (updated: Partial<AppConfig>) => {
-    setConfig((prev) => {
-      const next = { ...prev, ...updated };
-      invokeCommand("save_config", {
+    const next = { ...config, ...updated };
+    setConfig(next);
+    try {
+      const currentRaw = await invokeCommand<Record<string, unknown>>("get_config").catch(() => ({}));
+      await invokeCommand("save_config", {
         config: {
+          ...currentRaw,
           groq_api_key: next.apiKeys?.groq?.trim() || null,
           gemini_api_key: next.apiKeys?.gemini?.trim() || null,
           openrouter_api_key: next.apiKeys?.openrouter?.trim() || null,
@@ -191,10 +194,11 @@ export const DashboardWindow: React.FC = () => {
             quick_input: next.hotkeys.quickInput,
           },
         },
-      }).catch((e) => console.warn("Failed to persist config:", e));
-      return next;
-    });
-    toast.success("Configuration updated successfully");
+      });
+      toast.success("Configuration saved to disk");
+    } catch (e) {
+      toast.error(`Failed to save configuration: ${e}`);
+    }
   };
 
   const handleSaveHotkeys = async (updated: AppHotkeys) => {
@@ -359,8 +363,8 @@ export const DashboardWindow: React.FC = () => {
 
           <Card className="p-2.5 space-y-1.5 text-xs">
             <div className="flex items-center justify-between text-zinc-400">
-              <span>Talk</span>
-              <span className="kbd-cap">Ctrl+Shift+Space</span>
+              <span>Talk (Hold)</span>
+              <span className="kbd-cap">Ctrl+Space</span>
             </div>
             <div className="flex items-center justify-between text-zinc-400">
               <span>Dictate</span>
@@ -460,7 +464,7 @@ export const DashboardWindow: React.FC = () => {
               </Card>
             </TabsContent>
 
-            <TabsContent value="logs" className="outline-none">
+            <TabsContent value="logs" forceMount className="outline-none data-[state=inactive]:hidden">
               <LiveLogs />
             </TabsContent>
 

@@ -7,8 +7,10 @@ export const BubbleWindow: React.FC = () => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [caption, setCaption] = useState<string>("Listening...");
   const [speaker, setSpeaker] = useState<"user" | "clicky" | "system">("user");
+  const [talkState, setTalkState] = useState<string>("listening");
   const [isActive, setIsActive] = useState<boolean>(true);
-  const audioLevelsRef = useRef<number[]>(new Array(24).fill(4));
+  const audioLevelsRef = useRef<number[]>(new Array(24).fill(3));
+  const latestRmsRef = useRef<number>(0);
 
   // Audio waveform animation loop
   useEffect(() => {
@@ -29,22 +31,29 @@ export const BubbleWindow: React.FC = () => {
       const startX = (canvas.width - totalWidth) / 2;
       const centerY = canvas.height / 2;
 
-      // Simulate or update dynamic sound waves
       const levels = audioLevelsRef.current;
+      const now = performance.now() / 180;
       for (let i = 0; i < numBars; i++) {
-        if (isActive) {
-          // Dynamic undulating voice frequency bars
-          const target = Math.random() * 20 + 3;
-          levels[i] += (target - levels[i]) * 0.25;
-        } else {
-          levels[i] += (2 - levels[i]) * 0.1;
+        let target = 2.5;
+        if (talkState === "listening") {
+          const rmsAmp = Math.min(20, latestRmsRef.current * 450);
+          const waveShape = 0.5 + 0.5 * Math.sin(now + i * 0.55);
+          target = Math.max(3, 3 + rmsAmp * waveShape);
+        } else if (talkState === "transcribing" || talkState === "thinking") {
+          target = 4 + 5 * (0.5 + 0.5 * Math.sin(now * 1.4 - i * 0.35));
+        } else if (talkState === "speaking") {
+          target = 5 + 11 * (0.5 + 0.5 * Math.sin(now * 2.0 + i * 0.7));
         }
+        levels[i] += (target - levels[i]) * 0.28;
 
         const h = levels[i];
         const x = startX + i * (barWidth + gap);
 
         const gradient = ctx.createLinearGradient(0, centerY - h, 0, centerY + h);
-        if (speaker === "clicky") {
+        if (talkState === "thinking" || talkState === "transcribing") {
+          gradient.addColorStop(0, "#fbbf24");
+          gradient.addColorStop(1, "#f59e0b");
+        } else if (speaker === "clicky" || talkState === "speaking") {
           gradient.addColorStop(0, "#a855f7");
           gradient.addColorStop(1, "#38bdf8");
         } else {
@@ -63,38 +72,68 @@ export const BubbleWindow: React.FC = () => {
 
     animId = requestAnimationFrame(renderWave);
     return () => cancelAnimationFrame(animId);
-  }, [isActive, speaker]);
+  }, [isActive, speaker, talkState]);
 
-  // Listen for real-time transcript streaming events
+  // Listen for real-time pipeline and transcript events
   useEffect(() => {
-    const unlistenTranscript = listenEvent<TranscriptEvent>("transcript_chunk", (ev) => {
-      setCaption(ev.text);
-      setSpeaker(ev.speaker);
-      setIsActive(ev.audioActive ?? true);
+    const unlistenState = listenEvent<string>("talk:state", (st) => {
+      setTalkState(st);
+      if (st === "listening") {
+        setSpeaker("user");
+        setCaption("Listening...");
+        setIsActive(true);
+      } else if (st === "transcribing") {
+        setSpeaker("system");
+        setCaption("Transcribing...");
+        setIsActive(true);
+      } else if (st === "thinking") {
+        setSpeaker("clicky");
+        setCaption("Thinking...");
+        setIsActive(true);
+      } else if (st === "speaking") {
+        setSpeaker("clicky");
+        setIsActive(true);
+      } else {
+        setIsActive(false);
+        latestRmsRef.current = 0;
+      }
     });
 
-    const unlistenAudioBytes = listenEvent<ArrayBuffer>("audio_waveform_bytes", (buffer) => {
-      // If raw PCM waveform is streamed over binary channel, compute amplitude
-      const view = new Uint8Array(buffer);
-      if (view.length > 0) {
-        let sum = 0;
-        for (let i = 0; i < Math.min(view.length, 64); i++) {
-          sum += Math.abs(view[i] - 128);
-        }
-        const avg = sum / 64;
-        audioLevelsRef.current = audioLevelsRef.current.map(() => Math.min(26, 4 + avg * 0.5));
+    const unlistenTranscript = listenEvent<TranscriptEvent>("transcript_chunk", (ev) => {
+      if (ev?.text) setCaption(ev.text);
+      if (ev?.speaker) setSpeaker(ev.speaker);
+      setIsActive(ev?.audioActive ?? true);
+    });
+
+    const unlistenTalkText = listenEvent<string>("talk:transcript", (text) => {
+      if (text && text.trim()) {
+        setSpeaker("user");
+        setCaption(`"${text.trim()}"`);
+      }
+    });
+
+    const unlistenBubbleUpdate = listenEvent<string>("bubble_update", (reply) => {
+      if (reply && reply.trim()) {
+        setSpeaker("clicky");
+        setCaption(reply.trim());
       }
     });
 
     const unlistenAmplitude = listenEvent<number>("audio_amplitude", (rms) => {
-      const scaled = Math.min(26, Math.max(4, rms * 350));
-      audioLevelsRef.current = audioLevelsRef.current.map(() => Math.max(3, scaled + (Math.random() * 6 - 3)));
+      latestRmsRef.current = rms;
+    });
+
+    const unlistenRms = listenEvent<number>("audio:rms", (rms) => {
+      latestRmsRef.current = rms;
     });
 
     return () => {
+      unlistenState.then((un) => un());
       unlistenTranscript.then((un) => un());
-      unlistenAudioBytes.then((un) => un());
+      unlistenTalkText.then((un) => un());
+      unlistenBubbleUpdate.then((un) => un());
       unlistenAmplitude.then((un) => un());
+      unlistenRms.then((un) => un());
     };
   }, []);
 

@@ -149,15 +149,22 @@ impl TalkController {
     pub async fn start_talk(&self) -> Result<()> {
         let _guard = self.op_lock.lock().await;
 
-        {
+        let needs_barge_in = {
             let state = self.current_state.lock().await;
             if *state == TalkState::Speaking {
-                drop(state);
-                self.barge_in().await;
+                true
             } else if *state != TalkState::Idle {
                 return Ok(());
+            } else {
+                false
             }
+        };
 
+        if needs_barge_in {
+            self.barge_in().await;
+        }
+
+        {
             let mut state = self.current_state.lock().await;
             if *state != TalkState::Idle {
                 return Ok(());
@@ -258,9 +265,10 @@ impl TalkController {
     }
 
     pub async fn stop_talk(&self) -> Result<()> {
-        let _guard = self.op_lock.lock().await;
-
+        // Hold op_lock ONLY for the atomic state transition out of Listening,
+        // NOT across long-running STT / LLM / TTS calls (which would block barge-in).
         {
+            let _guard = self.op_lock.lock().await;
             let mut state = self.current_state.lock().await;
             if *state != TalkState::Listening {
                 return Ok(());
@@ -309,6 +317,10 @@ impl TalkController {
             let mut state = self.current_state.lock().await;
             *state = TalkState::Thinking;
             Self::emit_talk_state(&self.app_handle, TalkState::Thinking);
+            let _ = self.app_handle.emit(
+                "transcript_chunk",
+                serde_json::json!({ "text": format!("Thinking: {}", transcript), "speaker": "clicky", "audioActive": false }),
+            );
             emit_activity_log(&self.app_handle, "llm", "Prompting AI Model", "Routing transcript with active screen & UI context...");
         }
 
@@ -413,6 +425,15 @@ impl TalkController {
         *state = TalkState::Idle;
         Self::emit_talk_state(&self.app_handle, TalkState::Idle);
         emit_activity_log(&self.app_handle, "talk", "Ready (Idle)", "Voice pipeline returned to standby.");
+        let app_hide = self.app_handle.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            if let Some(app_state) = app_hide.try_state::<AppState>() {
+                if app_state.talk_controller.get_state().await == TalkState::Idle {
+                    let _ = WindowManager::hide(&app_hide, "bubble");
+                }
+            }
+        });
         Ok(())
     }
 

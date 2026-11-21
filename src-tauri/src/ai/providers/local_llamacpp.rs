@@ -61,6 +61,7 @@ impl LocalLlamaProvider {
         messages: &[ChatMessage],
         tools: &[ToolDefinition],
         include_images: bool,
+        disable_think: bool,
     ) -> serde_json::Value {
         let formatted_messages: Vec<serde_json::Value> = messages
             .iter()
@@ -87,6 +88,10 @@ impl LocalLlamaProvider {
                 "temperature": 0.2
             }
         });
+
+        if disable_think {
+            payload["think"] = json!(false);
+        }
 
         if !tools.is_empty() {
             let tools_json: Vec<serde_json::Value> = tools
@@ -122,7 +127,7 @@ impl LlmProvider for LocalLlamaProvider {
         tools: &[ToolDefinition],
     ) -> Result<Receiver<Result<ChatChunk>>> {
         let url = format!("{}/api/chat", self.base_url.trim_end_matches('/'));
-        let payload = Self::build_ollama_payload(model, messages, tools, true);
+        let payload = Self::build_ollama_payload(model, messages, tools, true, true);
 
         let mut response = self
             .client
@@ -132,9 +137,9 @@ impl LlmProvider for LocalLlamaProvider {
             .await
             .map_err(|e| AppError::Ai(format!("Local Ollama request error: {e}")))?;
 
-        // If a text-only local model rejects `images` with HTTP 400, automatically retry without images
+        // If a text-only or older Ollama build rejects `images` or `think: false` with HTTP 400, retry cleanly
         if response.status().as_u16() == 400 {
-            let retry_payload = Self::build_ollama_payload(model, messages, tools, false);
+            let retry_payload = Self::build_ollama_payload(model, messages, tools, false, false);
             response = self
                 .client
                 .post(&url)
