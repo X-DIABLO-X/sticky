@@ -8,6 +8,8 @@ use crate::error::{AppError, Result};
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+const EMBEDDED_LOCAL_STT_PY: &str = include_str!("../../../scripts/local_stt.py");
+
 #[derive(Clone)]
 pub struct SttService {
     groq_api_key: Option<String>,
@@ -225,7 +227,11 @@ pub fn resolve_script_path(filename: &str) -> PathBuf {
             candidates.push(dir.join("scripts").join(filename));
             candidates.push(dir.join("resources").join("scripts").join(filename));
             candidates.push(dir.join("..").join("scripts").join(filename));
+            candidates.push(dir.join("..").join("..").join("scripts").join(filename));
         }
+    }
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(home.join(".heyclicky").join("scripts").join(filename));
     }
 
     for c in candidates {
@@ -233,5 +239,19 @@ pub fn resolve_script_path(filename: &str) -> PathBuf {
             return c;
         }
     }
+
+    // Self-contained fallback: extract embedded local_stt.py so the exe works from any folder/shortcut
+    if filename == "local_stt.py" {
+        let target = dirs::home_dir()
+            .map(|h| h.join(".heyclicky").join("scripts").join("local_stt.py"))
+            .unwrap_or_else(|| std::env::temp_dir().join("sticky_local_stt.py"));
+        if let Some(parent) = target.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if std::fs::write(&target, EMBEDDED_LOCAL_STT_PY).is_ok() {
+            return target;
+        }
+    }
+
     PathBuf::from("scripts").join(filename)
 }
