@@ -120,6 +120,7 @@ impl ModelRouter {
         match task {
             TaskType::DictationCleanup => {
                 if let Some(ref g) = groq {
+                    chain.push((g.clone(), "qwen/qwen3.8-27b".to_string()));
                     chain.push((g.clone(), "openai/gpt-oss-20b".to_string()));
                 }
                 if let Some(m) = local_model {
@@ -130,14 +131,15 @@ impl ModelRouter {
                 }
             }
             TaskType::FastTalk => {
-                if let Some(m) = local_model {
-                    chain.push((local.clone(), m));
-                }
                 if let Some(ref g) = groq {
+                    chain.push((g.clone(), "qwen/qwen3.8-27b".to_string()));
                     chain.push((g.clone(), "openai/gpt-oss-20b".to_string()));
                 }
                 if let Some(ref gem) = gemini {
                     chain.push((gem.clone(), "gemini-2.5-flash-lite".to_string()));
+                }
+                if let Some(m) = local_model {
+                    chain.push((local.clone(), m));
                 }
                 if let Some(ref o) = openrouter {
                     chain.push((o.clone(), "google/gemma-4-31b-it:free".to_string()));
@@ -145,12 +147,15 @@ impl ModelRouter {
                 }
             }
             TaskType::ScreenVision | TaskType::GuiDriving => {
-                if let Some(m) = local_model {
-                    chain.push((local.clone(), m));
+                if let Some(ref g) = groq {
+                    chain.push((g.clone(), "qwen/qwen3.8-27b".to_string()));
                 }
                 if let Some(ref gem) = gemini {
                     chain.push((gem.clone(), "gemini-2.5-flash-lite".to_string()));
                     chain.push((gem.clone(), "gemini-2.5-flash".to_string()));
+                }
+                if let Some(m) = local_model {
+                    chain.push((local.clone(), m));
                 }
                 if let Some(ref o) = openrouter {
                     chain.push((o.clone(), "google/gemma-4-31b-it:free".to_string()));

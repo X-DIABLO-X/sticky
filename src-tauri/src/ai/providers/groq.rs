@@ -1,3 +1,4 @@
+use std::time::Duration;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::Client;
@@ -13,30 +14,48 @@ pub struct GroqProvider {
 
 impl GroqProvider {
     pub fn new(api_key: String) -> Self {
-        Self {
-            api_key,
-            client: Client::new(),
-        }
-    }
-}
-
-#[async_trait]
-impl LlmProvider for GroqProvider {
-    fn provider_name(&self) -> &str {
-        "groq"
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(60))
+            .build()
+            .unwrap_or_else(|_| Client::new());
+        Self { api_key, client }
     }
 
-    async fn stream_chat(
-        &self,
+    fn build_payload(
         model: &str,
         messages: &[ChatMessage],
         tools: &[ToolDefinition],
-    ) -> Result<Receiver<Result<ChatChunk>>> {
-        let url = "https://api.groq.com/openai/v1/chat/completions";
-
+        include_images: bool,
+    ) -> serde_json::Value {
         let formatted_messages: Vec<serde_json::Value> = messages
             .iter()
             .map(|m| {
+                if include_images {
+                    if let Some(ref imgs) = m.images_base64 {
+                        if !imgs.is_empty() {
+                            let mut parts = vec![json!({
+                                "type": "text",
+                                "text": m.content
+                            })];
+                            for b64 in imgs {
+                                let url = if b64.starts_with("data:") {
+                                    b64.clone()
+                                } else {
+                                    format!("data:image/jpeg;base64,{b64}")
+                                };
+                                parts.push(json!({
+                                    "type": "image_url",
+                                    "image_url": { "url": url }
+                                }));
+                            }
+                            return json!({
+                                "role": m.role,
+                                "content": parts
+                            });
+                        }
+                    }
+                }
                 json!({
                     "role": m.role,
                     "content": m.content
@@ -48,7 +67,7 @@ impl LlmProvider for GroqProvider {
             "model": model,
             "messages": formatted_messages,
             "stream": true,
-            "temperature": 0.3
+            "temperature": 0.25
         });
 
         if !tools.is_empty() {
@@ -68,13 +87,44 @@ impl LlmProvider for GroqProvider {
             payload["tools"] = json!(tools_json);
         }
 
-        let response = self.client
+        payload
+    }
+}
+
+#[async_trait]
+impl LlmProvider for GroqProvider {
+    fn provider_name(&self) -> &str {
+        "groq"
+    }
+
+    async fn stream_chat(
+        &self,
+        model: &str,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+    ) -> Result<Receiver<Result<ChatChunk>>> {
+        let url = "https://api.groq.com/openai/v1/chat/completions";
+        let payload = Self::build_payload(model, messages, tools, true);
+
+        let mut response = self.client
             .post(url)
             .bearer_auth(&self.api_key)
             .json(&payload)
             .send()
             .await
             .map_err(|e| AppError::Ai(format!("Groq request failed: {}", e)))?;
+
+        // If a text-only Groq model rejects image_url with HTTP 400, retry without images
+        if response.status().as_u16() == 400 {
+            let retry_payload = Self::build_payload(model, messages, tools, false);
+            response = self.client
+                .post(url)
+                .bearer_auth(&self.api_key)
+                .json(&retry_payload)
+                .send()
+                .await
+                .map_err(|e| AppError::Ai(format!("Groq text-only retry failed: {}", e)))?;
+        }
 
         if !response.status().is_success() {
             let status = response.status();
