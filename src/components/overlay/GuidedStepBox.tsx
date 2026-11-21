@@ -22,7 +22,11 @@ export const GuidedStepBox: React.FC<GuidedStepBoxProps> = ({
 }) => {
   if (!step || !step.bbox || step.bbox.length < 4) return null;
 
-  const [x1, y1, x2, y2] = step.bbox;
+  const [rawX1, rawY1, rawX2, rawY2] = step.bbox;
+  const x1 = rawX1 <= 1000 ? (rawX1 / 1000) * window.innerWidth : rawX1;
+  const y1 = rawY1 <= 1000 ? (rawY1 / 1000) * window.innerHeight : rawY1;
+  const x2 = rawX2 <= 1000 ? (rawX2 / 1000) * window.innerWidth : rawX2;
+  const y2 = rawY2 <= 1000 ? (rawY2 / 1000) * window.innerHeight : rawY2;
   const width = Math.max(x2 - x1, 40);
   const height = Math.max(y2 - y1, 24);
 

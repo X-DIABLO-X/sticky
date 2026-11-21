@@ -324,16 +324,36 @@ impl TalkController {
             emit_activity_log(&self.app_handle, "llm", "Prompting AI Model", "Routing transcript with active screen & UI context...");
         }
 
+        // Refresh screen + UI Automation context right now so coordinates are never stale
+        self.prewarmer.update_now().await;
         let (a11y, screen) = self.prewarmer.get_cached_context().await;
+        let (mon_x, mon_y, mon_w, mon_h) = crate::screen::capture::ScreenCaptureService::monitor_bounds(0);
         let mut user_message_text = transcript.clone();
         if let Some(tree) = a11y {
             let mut interactive = Vec::new();
             tree.root.collect_interactive(&mut interactive);
             if !interactive.is_empty() {
-                let json_tree = serde_json::to_string(&interactive).unwrap_or_default();
+                let normalized_elements: Vec<serde_json::Value> = interactive
+                    .into_iter()
+                    .filter(|n| n.bbox[2] > 2 && n.bbox[3] > 2)
+                    .take(80)
+                    .map(|n| {
+                        let (bbox_norm, center_norm) =
+                            crate::screen::capture::ScreenCaptureService::physical_bbox_to_normalized(
+                                n.bbox, mon_x, mon_y, mon_w, mon_h,
+                            );
+                        serde_json::json!({
+                            "role": n.role,
+                            "name": n.name,
+                            "bbox": bbox_norm,
+                            "center": center_norm
+                        })
+                    })
+                    .collect();
+                let json_tree = serde_json::to_string(&normalized_elements).unwrap_or_default();
                 user_message_text.push_str(&format!(
-                    "\n\n[Active Window: \"{}\", UI Elements: {}]",
-                    tree.window_title, json_tree
+                    "\n\n[Active Window: \"{}\" | Primary Monitor: {}x{} | All UI element bbox [x1,y1,x2,y2] & center [cx,cy] are ALREADY normalized 0-1000 — copy them directly into [POINT:cx,cy:...], [DRAW:...], or [STEP:...]: {}]",
+                    tree.window_title, mon_w, mon_h, json_tree
                 ));
             }
         }

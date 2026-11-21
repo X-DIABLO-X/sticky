@@ -116,27 +116,41 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
 
       ctx.save();
       ctx.globalAlpha = alpha;
-      const stroke = item.color || "#38bdf8";
+      const stroke = item.color || "#10b981";
       const roughness = 1.6;
+      const vw = canvas.width;
+      const vh = canvas.height;
+      // Helper: scale normalized 0..1000 coords to viewport pixels (pass through if already > 1000)
+      const sx = (v: number) => (v <= 1000 ? (v / 1000) * vw : v);
+      const sy = (v: number) => (v <= 1000 ? (v / 1000) * vh : v);
+      const sr = (v: number) => (v <= 1000 ? (v / 1000) * Math.min(vw, vh) : v);
 
       if (item.shape === "circle" && item.coords.length >= 3) {
-        const [cx, cy, r] = item.coords;
+        const cx = sx(item.coords[0]);
+        const cy = sy(item.coords[1]);
+        const r = Math.max(10, sr(item.coords[2]));
         rc.circle(cx, cy, r * 2, {
           stroke,
           strokeWidth: 2.5,
           roughness,
         });
       } else if (item.shape === "box" && item.coords.length >= 4) {
-        const [x1, y1, x2, y2] = item.coords;
-        const width = x2 - x1;
-        const height = y2 - y1;
+        const x1 = sx(item.coords[0]);
+        const y1 = sy(item.coords[1]);
+        const x2 = sx(item.coords[2]);
+        const y2 = sy(item.coords[3]);
+        const width = Math.max(8, x2 - x1);
+        const height = Math.max(8, y2 - y1);
         rc.rectangle(x1, y1, width, height, {
           stroke,
           strokeWidth: 2.5,
           roughness,
         });
       } else if (item.shape === "arrow" && item.coords.length >= 4) {
-        const [x1, y1, x2, y2] = item.coords;
+        const x1 = sx(item.coords[0]);
+        const y1 = sy(item.coords[1]);
+        const x2 = sx(item.coords[2]);
+        const y2 = sy(item.coords[3]);
         rc.line(x1, y1, x2, y2, { stroke, strokeWidth: 3, roughness: 1.2 });
         // Arrow head
         const angle = Math.atan2(y2 - y1, x2 - x1);
@@ -160,8 +174,8 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
 
       // Draw label if available
       if (item.label && item.coords.length >= 2) {
-        const lx = item.coords[0];
-        const ly = Math.max(20, item.coords[1] - 8);
+        const lx = sx(item.coords[0]);
+        const ly = Math.max(20, sy(item.coords[1]) - 8);
         ctx.font = "bold 13px system-ui, sans-serif";
         ctx.fillStyle = stroke;
         ctx.fillText(item.label, lx, ly);

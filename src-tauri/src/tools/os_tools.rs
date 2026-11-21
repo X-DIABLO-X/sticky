@@ -77,10 +77,31 @@ pub fn register_os_tools(registry: &mut ToolRegistry) {
 
                 let mut interactive_nodes = Vec::new();
                 tree.root.collect_interactive(&mut interactive_nodes);
+                let (mon_x, mon_y, mon_w, mon_h) = ScreenCaptureService::monitor_bounds(0);
+                let normalized: Vec<serde_json::Value> = interactive_nodes
+                    .into_iter()
+                    .filter(|n| n.bbox[2] > 2 && n.bbox[3] > 2)
+                    .take(100)
+                    .map(|n| {
+                        let (bbox_norm, center_norm) = ScreenCaptureService::physical_bbox_to_normalized(
+                            n.bbox, mon_x, mon_y, mon_w, mon_h,
+                        );
+                        json!({
+                            "id": n.id,
+                            "role": n.role,
+                            "name": n.name,
+                            "value": n.value,
+                            "bbox_norm": bbox_norm,
+                            "center_norm": center_norm
+                        })
+                    })
+                    .collect();
 
                 Ok(json!({
                     "window_title": tree.window_title,
-                    "interactive_elements": interactive_nodes
+                    "coordinate_space": "normalized_0_1000",
+                    "monitor_resolution": [mon_w, mon_h],
+                    "interactive_elements": normalized
                 }))
             })
         }),
@@ -89,14 +110,16 @@ pub fn register_os_tools(registry: &mut ToolRegistry) {
     // 3. mouse_click
     let click_def = ToolDefinition {
         name: "mouse_click".to_string(),
-        description: "Click a screen coordinate with the mouse (left, right, or double).".to_string(),
+        description: "Click a screen coordinate with the mouse (left, right, or double). Coordinates are normalized 0-1000 by default (matching UI elements and screenshots).".to_string(),
         parameters: json!({
             "type": "object",
             "required": ["x", "y"],
             "properties": {
-                "x": { "type": "integer" },
-                "y": { "type": "integer" },
-                "button": { "type": "string", "enum": ["left", "right", "double"], "default": "left" }
+                "x": { "type": "number", "description": "X coordinate (0-1000 normalized by default)" },
+                "y": { "type": "number", "description": "Y coordinate (0-1000 normalized by default)" },
+                "button": { "type": "string", "enum": ["left", "right", "double"], "default": "left" },
+                "screen_index": { "type": "integer", "default": 0 },
+                "coordinate_space": { "type": "string", "enum": ["normalized", "pixels"], "default": "normalized" }
             }
         }),
     };
@@ -104,18 +127,25 @@ pub fn register_os_tools(registry: &mut ToolRegistry) {
         click_def,
         Arc::new(|args| {
             Box::pin(async move {
-                let x = args.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-                let y = args.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                let raw_x = args.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let raw_y = args.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let screen_index = args.get("screen_index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let coord_space = args.get("coordinate_space").and_then(|v| v.as_str()).unwrap_or("normalized");
+                let (px, py) = if coord_space == "pixels" {
+                    (raw_x.round() as i32, raw_y.round() as i32)
+                } else {
+                    ScreenCaptureService::normalized_to_physical(raw_x, raw_y, screen_index)
+                };
                 let btn = args.get("button").and_then(|v| v.as_str()).unwrap_or("left").to_string();
                 let btn_clone = btn.clone();
 
                 tauri::async_runtime::spawn_blocking(move || {
                     let mut sim = InputSimulator::new()?;
-                    sim.click(x, y, &btn_clone)?;
+                    sim.click(px, py, &btn_clone)?;
                     Ok::<(), crate::error::AppError>(())
                 }).await.unwrap_or(Err(crate::error::AppError::Internal("timeout".into())))?;
 
-                Ok(json!({ "status": "clicked", "x": x, "y": y, "button": btn }))
+                Ok(json!({ "status": "clicked", "x": px, "y": py, "button": btn }))
             })
         }),
     );

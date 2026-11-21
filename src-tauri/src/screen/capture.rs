@@ -16,6 +16,75 @@ pub struct CapturedScreen {
 }
 
 impl ScreenCaptureService {
+    /// Returns (origin_x, origin_y, width, height) in physical pixels for the given monitor (defaulting to primary).
+    pub fn monitor_bounds(monitor_index: usize) -> (i32, i32, u32, u32) {
+        if let Ok(monitors) = Monitor::all() {
+            if let Some(m) = monitors.get(monitor_index).or_else(|| monitors.first()) {
+                let x = m.x().unwrap_or(0);
+                let y = m.y().unwrap_or(0);
+                let w = m.width().unwrap_or(1920).max(1);
+                let h = m.height().unwrap_or(1080).max(1);
+                return (x, y, w, h);
+            }
+        }
+        #[cfg(windows)]
+        {
+            use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+            unsafe {
+                let w = GetSystemMetrics(SM_CXSCREEN).max(1) as u32;
+                let h = GetSystemMetrics(SM_CYSCREEN).max(1) as u32;
+                return (0, 0, w, h);
+            }
+        }
+        #[cfg(not(windows))]
+        (0, 0, 1920, 1080)
+    }
+
+    /// Returns the top-left origin (vx, vy) of the virtual desktop (important when monitors sit left/above primary).
+    pub fn virtual_desktop_origin() -> (i32, i32) {
+        #[cfg(windows)]
+        {
+            use windows::Win32::UI::WindowsAndMessaging::{
+                GetSystemMetrics, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+            };
+            unsafe {
+                return (
+                    GetSystemMetrics(SM_XVIRTUALSCREEN),
+                    GetSystemMetrics(SM_YVIRTUALSCREEN),
+                );
+            }
+        }
+        #[cfg(not(windows))]
+        (0, 0)
+    }
+
+    /// Converts normalized 0..1000 coordinates into exact physical screen pixels on `monitor_index`.
+    pub fn normalized_to_physical(nx: f64, ny: f64, monitor_index: usize) -> (i32, i32) {
+        let (mx, my, mw, mh) = Self::monitor_bounds(monitor_index);
+        let px = mx + ((nx.clamp(0.0, 1000.0) / 1000.0) * mw as f64).round() as i32;
+        let py = my + ((ny.clamp(0.0, 1000.0) / 1000.0) * mh as f64).round() as i32;
+        (px, py)
+    }
+
+    /// Converts a physical `[x, y, width, height]` UIA bounding box into normalized 0..1000 `([x1, y1, x2, y2], [cx, cy])`.
+    pub fn physical_bbox_to_normalized(
+        bbox: [i32; 4],
+        mon_x: i32,
+        mon_y: i32,
+        mon_w: u32,
+        mon_h: u32,
+    ) -> ([i32; 4], [i32; 2]) {
+        let mw = mon_w.max(1) as f64;
+        let mh = mon_h.max(1) as f64;
+        let x1 = (((bbox[0] - mon_x) as f64 / mw) * 1000.0).round().clamp(0.0, 1000.0) as i32;
+        let y1 = (((bbox[1] - mon_y) as f64 / mh) * 1000.0).round().clamp(0.0, 1000.0) as i32;
+        let x2 = (((bbox[0] + bbox[2] - mon_x) as f64 / mw) * 1000.0).round().clamp(0.0, 1000.0) as i32;
+        let y2 = (((bbox[1] + bbox[3] - mon_y) as f64 / mh) * 1000.0).round().clamp(0.0, 1000.0) as i32;
+        let cx = (x1 + x2) / 2;
+        let cy = (y1 + y2) / 2;
+        ([x1, y1, x2, y2], [cx, cy])
+    }
+
     /// Capture screen from monitor_index, optional crop_bbox: [x1, y1, x2, y2], downscaled to max 1280px width
     pub fn capture(
         monitor_index: usize,

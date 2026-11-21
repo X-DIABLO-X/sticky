@@ -67,14 +67,15 @@ impl CursorTracker {
                 let (x, y) = get_current_cursor_pos();
                 let clicking = is_mouse_down();
 
-                // 1. Broadcast cursor position to all windows (overlay, dashboard, bubble)
+                // 1. Broadcast cursor position relative to virtual desktop overlay origin
                 if (x, y) != last_pos || clicking != last_click {
                     last_pos = (x, y);
                     last_click = clicking;
+                    let (vx, vy) = crate::screen::capture::ScreenCaptureService::virtual_desktop_origin();
 
                     let _ = app.emit("cursor_pos", serde_json::json!({
-                        "x": x,
-                        "y": y,
+                        "x": x - vx,
+                        "y": y - vy,
                         "clicking": clicking
                     }));
                 }
