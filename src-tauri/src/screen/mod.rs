@@ -2,6 +2,7 @@ pub mod a11y;
 pub mod capture;
 pub mod cursor;
 pub mod input;
+pub mod ocr;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,7 +15,7 @@ use crate::audio::AudioEngine;
 use crate::config::AppConfig;
 use crate::error::Result;
 use crate::screen::a11y::get_focused_window_tree;
-use crate::screen::capture::{CapturedScreen, ScreenCaptureService};
+use crate::screen::capture::{CapturedScreen, DetectedElement, ScreenCaptureService};
 use crate::screen::ContextPrewarmer;
 use crate::ui::windows::WindowManager;
 use crate::AppState;
@@ -72,7 +73,142 @@ fn emit_pipeline_error(app: &AppHandle, stage: &str, message: impl Into<String>)
     );
 }
 
-fn broadcast_overlay_command(app: &AppHandle, cmd: &OverlayCommand) {
+fn broadcast_overlay_command(
+    app: &AppHandle,
+    cmd: &OverlayCommand,
+    element_map: &HashMap<u32, DetectedElement>,
+) {
+    match cmd {
+        OverlayCommand::PointRef {
+            element_id,
+            label,
+            screen,
+        } => {
+            if let Some(el) = element_map.get(element_id) {
+                let resolved_label = if label.is_empty() {
+                    el.label.clone()
+                } else {
+                    label.clone()
+                };
+                emit_activity_log(
+                    app,
+                    "overlay",
+                    "Pinpoint Element Resolved",
+                    &format!(
+                        "Resolved #{} (\"{}\") -> ({}, {})",
+                        element_id, el.label, el.center_norm[0], el.center_norm[1]
+                    ),
+                );
+                let resolved = OverlayCommand::Point {
+                    x: el.center_norm[0],
+                    y: el.center_norm[1],
+                    label: resolved_label,
+                    screen: screen.clone(),
+                };
+                broadcast_overlay_command(app, &resolved, element_map);
+            } else {
+                emit_activity_log(
+                    app,
+                    "overlay",
+                    "Unknown Element ID",
+                    &format!(
+                        "Element #{} not found in detected screen elements",
+                        element_id
+                    ),
+                );
+            }
+            return;
+        }
+        OverlayCommand::DrawRef {
+            shape,
+            element_id,
+            target_element_id,
+            color,
+            label,
+        } => {
+            let Some(el) = element_map.get(element_id) else {
+                emit_activity_log(
+                    app,
+                    "overlay",
+                    "Unknown Element ID",
+                    &format!(
+                        "Element #{} not found in detected screen elements",
+                        element_id
+                    ),
+                );
+                return;
+            };
+
+            let coords = match shape.as_str() {
+                "box" => vec![
+                    (el.bbox_norm[0] - 4).clamp(0, 1000),
+                    (el.bbox_norm[1] - 4).clamp(0, 1000),
+                    (el.bbox_norm[2] + 4).clamp(0, 1000),
+                    (el.bbox_norm[3] + 4).clamp(0, 1000),
+                ],
+                "circle" => {
+                    let w = (el.bbox_norm[2] - el.bbox_norm[0]).abs();
+                    let h = (el.bbox_norm[3] - el.bbox_norm[1]).abs();
+                    let r = (w.max(h) / 2 + 8).clamp(14, 120);
+                    vec![el.center_norm[0], el.center_norm[1], r]
+                }
+                "text" => {
+                    vec![el.center_norm[0], (el.bbox_norm[1] - 18).max(12)]
+                }
+                "arrow" | "line" => {
+                    if let Some(target_id) = target_element_id {
+                        let Some(el2) = element_map.get(target_id) else {
+                            emit_activity_log(
+                                app,
+                                "overlay",
+                                "Unknown Target Element ID",
+                                &format!(
+                                    "Target element #{} not found in detected screen elements",
+                                    target_id
+                                ),
+                            );
+                            return;
+                        };
+                        vec![
+                            el.center_norm[0],
+                            el.center_norm[1],
+                            el2.center_norm[0],
+                            el2.center_norm[1],
+                        ]
+                    } else {
+                        vec![
+                            (el.center_norm[0] - 60).max(0),
+                            (el.center_norm[1] - 40).max(0),
+                            el.center_norm[0],
+                            el.center_norm[1],
+                        ]
+                    }
+                }
+                _ => el.bbox_norm.to_vec(),
+            };
+
+            emit_activity_log(
+                app,
+                "overlay",
+                "Pinpoint Draw Resolved",
+                &format!(
+                    "Resolved DRAW {} #{} (\"{}\") -> {:?}",
+                    shape, element_id, el.label, coords
+                ),
+            );
+
+            let resolved = OverlayCommand::Draw {
+                shape: shape.clone(),
+                coords,
+                color: color.clone(),
+                label: label.clone(),
+            };
+            broadcast_overlay_command(app, &resolved, element_map);
+            return;
+        }
+        _ => {}
+    }
+
     if !matches!(cmd, OverlayCommand::Guide { .. }) {
         let _ = app.emit("overlay:command", cmd);
     }
@@ -119,52 +255,67 @@ fn broadcast_overlay_command(app: &AppHandle, cmd: &OverlayCommand) {
         OverlayCommand::ClearDrawings => {
             let _ = app.emit("overlay:clear_drawings", ());
         }
-        OverlayCommand::Guide { .. } => {}
-        OverlayCommand::Raw(_) => {}
+        OverlayCommand::Guide { .. }
+        | OverlayCommand::PointRef { .. }
+        | OverlayCommand::DrawRef { .. }
+        | OverlayCommand::Raw(_) => {}
     }
 }
 
-async fn capture_vlm_context() -> (String, Option<CapturedScreen>) {
-    let a11y_fut = tauri::async_runtime::spawn_blocking(|| get_focused_window_tree(6));
-    let screen_fut = tauri::async_runtime::spawn_blocking(|| {
-        ScreenCaptureService::capture_for_vlm(0, Some(1280))
-    });
-    let (a11y_res, screen_res) = tokio::join!(a11y_fut, screen_fut);
+async fn capture_vlm_context() -> (Option<CapturedScreen>, Vec<DetectedElement>, String) {
+    let a11y = tauri::async_runtime::spawn_blocking(|| get_focused_window_tree(5))
+        .await
+        .ok()
+        .and_then(|r| r.ok());
 
-    let a11y = a11y_res.ok().and_then(|r| r.ok());
-    let screen = screen_res.ok().and_then(|r| r.ok());
+    let (window_title, interactive) = if let Some(tree) = a11y {
+        let mut nodes = Vec::new();
+        tree.root.collect_interactive(&mut nodes);
+        (tree.window_title, nodes)
+    } else {
+        (String::new(), Vec::new())
+    };
 
-    let (mon_x, mon_y, mon_w, mon_h) = ScreenCaptureService::monitor_bounds(0);
-    let mut a11y_suffix = String::new();
-    if let Some(tree) = a11y {
-        let mut interactive = Vec::new();
-        tree.root.collect_interactive(&mut interactive);
-        if !interactive.is_empty() {
-            let normalized_elements: Vec<serde_json::Value> = interactive
-                .into_iter()
-                .filter(|n| n.bbox[2] > 2 && n.bbox[3] > 2)
-                .take(80)
-                .map(|n| {
-                    let (bbox_norm, center_norm) = ScreenCaptureService::physical_bbox_to_normalized(
-                        n.bbox, mon_x, mon_y, mon_w, mon_h,
-                    );
-                    serde_json::json!({
-                        "role": n.role,
-                        "name": n.name,
-                        "bbox": bbox_norm,
-                        "center": center_norm
-                    })
-                })
-                .collect();
-            let json_tree = serde_json::to_string(&normalized_elements).unwrap_or_default();
-            a11y_suffix = format!(
-                "\n\n[Active Window: \"{}\" | Primary Monitor: {}x{} | All UI element bbox [x1,y1,x2,y2] & center [cx,cy] are ALREADY normalized 0-1000 — cross-check with the 0-1000 screenshot grid and copy them directly into [POINT:cx,cy:...], [DRAW:...], or [STEP:...]: {}]",
-                tree.window_title, mon_w, mon_h, json_tree
-            );
-        }
+    let grounded = tauri::async_runtime::spawn_blocking(move || {
+        ScreenCaptureService::capture_grounded_for_vlm(0, Some(1280), &interactive)
+    })
+    .await
+    .ok()
+    .and_then(|r| r.ok());
+
+    match grounded {
+        Some(g) => (Some(g.screen), g.elements, window_title),
+        None => (None, Vec::new(), window_title),
     }
+}
 
-    (a11y_suffix, screen)
+fn format_detected_elements_context(window_title: &str, elements: &[DetectedElement]) -> String {
+    if window_title.is_empty() && elements.is_empty() {
+        return String::new();
+    }
+    let clean_title = window_title.replace('"', "'");
+    if elements.is_empty() {
+        return format!("\n\n[Active Window: \"{}\"]", clean_title);
+    }
+    let items: Vec<String> = elements
+        .iter()
+        .map(|el| {
+            format!(
+                "#{} \"{}\" [{},{},{},{}]",
+                el.id,
+                el.label.replace('"', "'"),
+                el.bbox_norm[0],
+                el.bbox_norm[1],
+                el.bbox_norm[2],
+                el.bbox_norm[3]
+            )
+        })
+        .collect();
+    format!(
+        "\n\n[Active Window: \"{}\" | Detected Screen Elements (USE #ID FOR PINPOINT ACCURACY): {}]",
+        clean_title,
+        items.join(", ")
+    )
 }
 
 impl TalkController {
@@ -391,10 +542,13 @@ impl TalkController {
             emit_activity_log(&self.app_handle, "llm", "Prompting AI Model", "Routing transcript with active screen & UI context...");
         }
 
-        // Capture fresh gridded VLM screenshot + normalized UI Automation context
-        let (a11y_suffix, screen) = capture_vlm_context().await;
+        // Capture fresh grounded VLM screenshot + Set-of-Mark detected elements (OCR + A11y)
+        let (screen, elements, window_title) = capture_vlm_context().await;
+        let element_map: HashMap<u32, DetectedElement> =
+            elements.iter().map(|e| (e.id, e.clone())).collect();
+        let elements_suffix = format_detected_elements_context(&window_title, &elements);
         let mut user_message_text = transcript.clone();
-        user_message_text.push_str(&a11y_suffix);
+        user_message_text.push_str(&elements_suffix);
 
         let chat_message = if let Some(sc) = screen {
             ChatMessage::user_with_image(user_message_text, sc.base64_data)
@@ -441,7 +595,7 @@ impl TalkController {
                             if let OverlayCommand::Guide { active } = cmd {
                                 guide_signal = Some(active);
                             } else {
-                                broadcast_overlay_command(&self.app_handle, &cmd);
+                                broadcast_overlay_command(&self.app_handle, &cmd, &element_map);
                             }
                         }
                         if !clean.is_empty() {
@@ -466,7 +620,7 @@ impl TalkController {
             if let OverlayCommand::Guide { active } = cmd {
                 guide_signal = Some(active);
             } else {
-                broadcast_overlay_command(&self.app_handle, &cmd);
+                broadcast_overlay_command(&self.app_handle, &cmd, &element_map);
             }
         }
         {
@@ -661,10 +815,13 @@ impl TalkController {
             *step
         };
 
-        let (a11y_suffix, screen) = capture_vlm_context().await;
+        let (screen, elements, window_title) = capture_vlm_context().await;
+        let element_map: HashMap<u32, DetectedElement> =
+            elements.iter().map(|e| (e.id, e.clone())).collect();
+        let elements_suffix = format_detected_elements_context(&window_title, &elements);
         let mut verify_prompt =
             Prompts::guide_click_verification_prompt(&goal, step_num, click_x, click_y);
-        verify_prompt.push_str(&a11y_suffix);
+        verify_prompt.push_str(&elements_suffix);
 
         let current_msg = if let Some(sc) = screen {
             ChatMessage::user_with_image(verify_prompt, sc.base64_data)
@@ -716,7 +873,7 @@ impl TalkController {
                             if let OverlayCommand::Guide { active } = cmd {
                                 guide_signal = Some(active);
                             } else {
-                                broadcast_overlay_command(&self.app_handle, &cmd);
+                                broadcast_overlay_command(&self.app_handle, &cmd, &element_map);
                             }
                         }
                         if !clean.is_empty() {
@@ -741,7 +898,7 @@ impl TalkController {
             if let OverlayCommand::Guide { active } = cmd {
                 guide_signal = Some(active);
             } else {
-                broadcast_overlay_command(&self.app_handle, &cmd);
+                broadcast_overlay_command(&self.app_handle, &cmd, &element_map);
             }
         }
         {

@@ -9,9 +9,21 @@ pub enum OverlayCommand {
         label: String,
         screen: String,
     },
+    PointRef {
+        element_id: u32,
+        label: String,
+        screen: String,
+    },
     Draw {
         shape: String,
         coords: Vec<i32>,
+        color: Option<String>,
+        label: Option<String>,
+    },
+    DrawRef {
+        shape: String,
+        element_id: u32,
+        target_element_id: Option<u32>,
         color: Option<String>,
         label: Option<String>,
     },
@@ -123,6 +135,36 @@ impl TagStreamParser {
     }
 }
 
+fn parse_draw_color_and_label(parts: &[&str]) -> (Option<String>, Option<String>) {
+    let mut color: Option<String> = None;
+    let mut label: Option<String> = None;
+
+    if let Some(p3) = parts.get(3) {
+        let trimmed = p3.trim();
+        if trimmed.starts_with('#') {
+            color = Some(trimmed.to_string());
+            if parts.len() >= 5 {
+                let lbl = parts[4..].join(":").trim().to_string();
+                if !lbl.is_empty() {
+                    label = Some(lbl);
+                }
+            }
+        } else if !trimmed.is_empty() {
+            let lbl = parts[3..].join(":").trim().to_string();
+            if !lbl.is_empty() {
+                label = Some(lbl);
+            }
+        } else if parts.len() >= 5 {
+            let lbl = parts[4..].join(":").trim().to_string();
+            if !lbl.is_empty() {
+                label = Some(lbl);
+            }
+        }
+    }
+
+    (color, label)
+}
+
 fn parse_tag(content: &str) -> Option<OverlayCommand> {
     let parts: Vec<&str> = content.split(':').collect();
     if parts.is_empty() {
@@ -131,6 +173,26 @@ fn parse_tag(content: &str) -> Option<OverlayCommand> {
 
     match parts[0].to_uppercase().as_str() {
         "POINT" => {
+            // [POINT:#12:Add] or [POINT:#12:Add:screen0] or [POINT:#12]
+            if parts.len() >= 2 {
+                let target = parts[1].trim();
+                if let Some(id_str) = target.strip_prefix('#') {
+                    if !id_str.contains(',') {
+                        let element_id = id_str.trim().parse::<u32>().ok()?;
+                        let label = parts
+                            .get(2)
+                            .map(|s| s.trim().to_string())
+                            .unwrap_or_default();
+                        let screen = parts.get(3).unwrap_or(&"screen0").trim().to_string();
+                        return Some(OverlayCommand::PointRef {
+                            element_id,
+                            label,
+                            screen,
+                        });
+                    }
+                }
+            }
+
             // [POINT:x,y:label:screenN] or [POINT:x,y:label]
             if parts.len() >= 3 {
                 let coords: Vec<&str> = parts[1].split(',').collect();
@@ -145,10 +207,9 @@ fn parse_tag(content: &str) -> Option<OverlayCommand> {
         }
         "DRAW" => {
             // [DRAW:clear]
-            // [DRAW:shape:coords]
-            // [DRAW:shape:coords:#color]
-            // [DRAW:shape:coords:label]
-            // [DRAW:shape:coords:#color:label]
+            // [DRAW:shape:#12[:#color][:label]]
+            // [DRAW:shape:#12->#24[:#color][:label]]
+            // [DRAW:shape:coords[:#color][:label]]
             if parts.len() >= 2 && parts[1].trim().eq_ignore_ascii_case("clear") {
                 return Some(OverlayCommand::ClearDrawings);
             }
@@ -158,7 +219,29 @@ fn parse_tag(content: &str) -> Option<OverlayCommand> {
                     "line" | "arrow" | "curve" | "polygon" | "circle" | "box" | "text" => {}
                     _ => return None,
                 }
-                let coords: Vec<i32> = parts[2]
+
+                let target_spec = parts[2].trim();
+                if let Some(rest) = target_spec.strip_prefix('#') {
+                    let (element_id, target_element_id) =
+                        if let Some((src, dst)) = rest.split_once("->") {
+                            let id1 = src.trim().parse::<u32>().ok()?;
+                            let id2 = dst.trim().strip_prefix('#')?.trim().parse::<u32>().ok()?;
+                            (id1, Some(id2))
+                        } else {
+                            let id1 = rest.trim().parse::<u32>().ok()?;
+                            (id1, None)
+                        };
+                    let (color, label) = parse_draw_color_and_label(&parts);
+                    return Some(OverlayCommand::DrawRef {
+                        shape,
+                        element_id,
+                        target_element_id,
+                        color,
+                        label,
+                    });
+                }
+
+                let coords: Vec<i32> = target_spec
                     .split(',')
                     .filter_map(|s| s.trim().parse::<i32>().ok())
                     .collect();
@@ -166,31 +249,7 @@ fn parse_tag(content: &str) -> Option<OverlayCommand> {
                     return None;
                 }
 
-                let mut color: Option<String> = None;
-                let mut label: Option<String> = None;
-
-                if let Some(p3) = parts.get(3) {
-                    let trimmed = p3.trim();
-                    if trimmed.starts_with('#') {
-                        color = Some(trimmed.to_string());
-                        if parts.len() >= 5 {
-                            let lbl = parts[4..].join(":").trim().to_string();
-                            if !lbl.is_empty() {
-                                label = Some(lbl);
-                            }
-                        }
-                    } else if !trimmed.is_empty() {
-                        let lbl = parts[3..].join(":").trim().to_string();
-                        if !lbl.is_empty() {
-                            label = Some(lbl);
-                        }
-                    } else if parts.len() >= 5 {
-                        let lbl = parts[4..].join(":").trim().to_string();
-                        if !lbl.is_empty() {
-                            label = Some(lbl);
-                        }
-                    }
-                }
+                let (color, label) = parse_draw_color_and_label(&parts);
 
                 Some(OverlayCommand::Draw {
                     shape,
@@ -422,5 +481,115 @@ mod tests {
             }
             _ => panic!("Expected Step command"),
         }
+    }
+
+    #[test]
+    fn test_point_ref_tags() {
+        let mut parser = TagStreamParser::new();
+        let (clean, cmds) = parser.feed_token(
+            "Click [POINT:#8:Add] then [POINT:#12:Export:screen0] and [POINT:#5] done.",
+        );
+        assert_eq!(clean, "Click then and done.");
+        assert_eq!(cmds.len(), 3);
+        assert_eq!(
+            cmds[0],
+            OverlayCommand::PointRef {
+                element_id: 8,
+                label: "Add".to_string(),
+                screen: "screen0".to_string(),
+            }
+        );
+        assert_eq!(
+            cmds[1],
+            OverlayCommand::PointRef {
+                element_id: 12,
+                label: "Export".to_string(),
+                screen: "screen0".to_string(),
+            }
+        );
+        assert_eq!(
+            cmds[2],
+            OverlayCommand::PointRef {
+                element_id: 5,
+                label: String::new(),
+                screen: "screen0".to_string(),
+            }
+        );
+
+        // Numeric ID without '#' and without ',' must NOT be parsed as PointRef or Point
+        let mut parser2 = TagStreamParser::new();
+        let (clean2, cmds2) = parser2.feed_token("Bad [POINT:12:Add] tag.");
+        assert_eq!(clean2, "Bad [POINT:12:Add] tag.");
+        assert!(cmds2.is_empty());
+    }
+
+    #[test]
+    fn test_draw_ref_tags() {
+        let mut parser = TagStreamParser::new();
+        let input = "Look [DRAW:box:#8:#10b981:Add] [DRAW:circle:#8:#38bdf8] [DRAW:text:#8:Click here] [DRAW:circle:#8] [DRAW:arrow:#8->#14:#10b981:Move] [DRAW:line:#8->#14:Connect] done.";
+        let (clean, cmds) = parser.feed_token(input);
+        assert_eq!(clean, "Look done.");
+        assert_eq!(cmds.len(), 6);
+
+        assert_eq!(
+            cmds[0],
+            OverlayCommand::DrawRef {
+                shape: "box".to_string(),
+                element_id: 8,
+                target_element_id: None,
+                color: Some("#10b981".to_string()),
+                label: Some("Add".to_string()),
+            }
+        );
+        assert_eq!(
+            cmds[1],
+            OverlayCommand::DrawRef {
+                shape: "circle".to_string(),
+                element_id: 8,
+                target_element_id: None,
+                color: Some("#38bdf8".to_string()),
+                label: None,
+            }
+        );
+        assert_eq!(
+            cmds[2],
+            OverlayCommand::DrawRef {
+                shape: "text".to_string(),
+                element_id: 8,
+                target_element_id: None,
+                color: None,
+                label: Some("Click here".to_string()),
+            }
+        );
+        assert_eq!(
+            cmds[3],
+            OverlayCommand::DrawRef {
+                shape: "circle".to_string(),
+                element_id: 8,
+                target_element_id: None,
+                color: None,
+                label: None,
+            }
+        );
+        assert_eq!(
+            cmds[4],
+            OverlayCommand::DrawRef {
+                shape: "arrow".to_string(),
+                element_id: 8,
+                target_element_id: Some(14),
+                color: Some("#10b981".to_string()),
+                label: Some("Move".to_string()),
+            }
+        );
+        assert_eq!(
+            cmds[5],
+            OverlayCommand::DrawRef {
+                shape: "line".to_string(),
+                element_id: 8,
+                target_element_id: Some(14),
+                color: None,
+                label: Some("Connect".to_string()),
+            }
+        );
     }
 }
