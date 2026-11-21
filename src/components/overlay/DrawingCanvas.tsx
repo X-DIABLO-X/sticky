@@ -11,6 +11,7 @@ interface DrawingItem extends OverlayDrawEvent {
 interface DrawingCanvasProps {
   externalDrawings?: OverlayDrawEvent[];
   clearSignal?: number;
+  guidedMode?: boolean;
   onScribbleFocusCrop?: (bbox: [number, number, number, number]) => void;
   onClearAll?: () => void;
 }
@@ -98,6 +99,7 @@ function drawLabelPill(
 export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
   externalDrawings = [],
   clearSignal = 0,
+  guidedMode = false,
   onScribbleFocusCrop,
   onClearAll,
 }) => {
@@ -108,6 +110,8 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
   const scribblePointsRef = useRef<Array<{ x: number; y: number }>>([]);
   const itemsRef = useRef<DrawingItem[]>(items);
   itemsRef.current = items;
+  const guidedModeRef = useRef<boolean>(guidedMode);
+  guidedModeRef.current = guidedMode;
 
   // Sync external drawings
   useEffect(() => {
@@ -212,22 +216,28 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
     const sr = (v: number) => (v <= 1000 ? (v / 1000) * Math.min(vw, vh) : v);
 
     const activeItems = itemsRef.current;
+    const isGuided = guidedModeRef.current;
     for (let idx = 0; idx < activeItems.length; idx++) {
       const item = activeItems[idx];
       const age = now - item.createdAt;
-      const fadeDuration = item.fadeMs ?? 8000;
+      const fadeDuration = item.fadeMs ?? 14000;
+      const stayPersistent = Boolean(item.persistent) || isGuided;
       let alpha = 1.0;
 
-      if (!item.persistent && age > fadeDuration - 2000) {
+      if (!stayPersistent && age > fadeDuration - 2000) {
         alpha = Math.max(0, 1 - (age - (fadeDuration - 2000)) / 2000);
       }
       if (alpha <= 0) continue;
+
+      // Smooth 280ms ease-out draw-in progress
+      const rawT = Math.min(1, Math.max(0, age / 280));
+      const drawT = 1 - Math.pow(1 - rawT, 3);
 
       const stroke = item.color || "#10b981";
       const coords = item.coords || [];
 
       ctx.save();
-      ctx.globalAlpha = alpha;
+      ctx.globalAlpha = alpha * Math.min(1, drawT * 1.4);
       ctx.strokeStyle = stroke;
       ctx.fillStyle = stroke;
       ctx.lineWidth = 2.5;
@@ -239,8 +249,8 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
       if (item.shape === "line" && coords.length >= 4) {
         const x1 = sx(coords[0]);
         const y1 = sy(coords[1]);
-        const x2 = sx(coords[2]);
-        const y2 = sy(coords[3]);
+        const x2 = x1 + (sx(coords[2]) - x1) * drawT;
+        const y2 = y1 + (sy(coords[3]) - y1) * drawT;
 
         ctx.beginPath();
         ctx.moveTo(x1, y1);
@@ -249,9 +259,11 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
       } else if (item.shape === "arrow" && coords.length >= 4) {
         const x1 = sx(coords[0]);
         const y1 = sy(coords[1]);
-        const x2 = sx(coords[2]);
-        const y2 = sy(coords[3]);
-        const angle = Math.atan2(y2 - y1, x2 - x1);
+        const fullX2 = sx(coords[2]);
+        const fullY2 = sy(coords[3]);
+        const x2 = x1 + (fullX2 - x1) * drawT;
+        const y2 = y1 + (fullY2 - y1) * drawT;
+        const angle = Math.atan2(fullY2 - y1, fullX2 - x1);
         const trim = 8;
         const dist = Math.hypot(x2 - x1, y2 - y1);
         const shaftEndX = dist > trim ? x2 - trim * Math.cos(angle) : x2;
@@ -262,7 +274,9 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
         ctx.lineTo(shaftEndX, shaftEndY);
         ctx.stroke();
 
-        drawArrowHead(ctx, x2, y2, angle, stroke, 15);
+        if (drawT > 0.35) {
+          drawArrowHead(ctx, x2, y2, angle, stroke, 15);
+        }
       } else if (item.shape === "curve" && coords.length >= 6) {
         const x1 = sx(coords[0]);
         const y1 = sy(coords[1]);
@@ -271,14 +285,23 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
         const x2 = sx(coords[4]);
         const y2 = sy(coords[5]);
 
+        // De Casteljau partial quadratic Bezier for smooth animated curve sketching
+        const qx1 = x1 + (cx - x1) * drawT;
+        const qy1 = y1 + (cy - y1) * drawT;
+        const qx2 = cx + (x2 - cx) * drawT;
+        const qy2 = cy + (y2 - cy) * drawT;
+        const endX = qx1 + (qx2 - qx1) * drawT;
+        const endY = qy1 + (qy2 - qy1) * drawT;
+
         ctx.beginPath();
         ctx.moveTo(x1, y1);
-        ctx.quadraticCurveTo(cx, cy, x2, y2);
+        ctx.quadraticCurveTo(qx1, qy1, endX, endY);
         ctx.stroke();
 
-        // Directional arrowhead aligned with end tangent (x2 - cx, y2 - cy)
-        const tangentAngle = Math.atan2(y2 - cy, x2 - cx);
-        drawArrowHead(ctx, x2, y2, tangentAngle, stroke, 15);
+        if (drawT > 0.35) {
+          const tangentAngle = Math.atan2(endY - qy1, endX - qx1);
+          drawArrowHead(ctx, endX, endY, tangentAngle, stroke, 15);
+        }
       } else if (item.shape === "polygon" && coords.length >= 6) {
         const vertexCount = Math.floor(coords.length / 2);
         ctx.beginPath();
@@ -290,7 +313,7 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
 
         // Soft translucent fill
         ctx.save();
-        ctx.globalAlpha = alpha * 0.16;
+        ctx.globalAlpha = alpha * 0.16 * drawT;
         ctx.shadowBlur = 0;
         ctx.fill();
         ctx.restore();
@@ -303,13 +326,15 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
         const r = Math.max(8, sr(coords[2]));
 
         ctx.beginPath();
-        ctx.arc(cx, cy, r, 0, Math.PI * 2);
+        ctx.arc(cx, cy, r, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * drawT);
 
-        ctx.save();
-        ctx.globalAlpha = alpha * 0.1;
-        ctx.shadowBlur = 0;
-        ctx.fill();
-        ctx.restore();
+        if (drawT >= 0.99) {
+          ctx.save();
+          ctx.globalAlpha = alpha * 0.1;
+          ctx.shadowBlur = 0;
+          ctx.fill();
+          ctx.restore();
+        }
 
         ctx.stroke();
       } else if (item.shape === "box" && coords.length >= 4) {
@@ -317,10 +342,15 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
         const ry1 = sy(coords[1]);
         const rx2 = sx(coords[2]);
         const ry2 = sy(coords[3]);
-        const x = Math.min(rx1, rx2);
-        const y = Math.min(ry1, ry2);
-        const width = Math.max(8, Math.abs(rx2 - rx1));
-        const height = Math.max(8, Math.abs(ry2 - ry1));
+        const cx = (rx1 + rx2) / 2;
+        const cy = (ry1 + ry2) / 2;
+        const fullW = Math.max(8, Math.abs(rx2 - rx1));
+        const fullH = Math.max(8, Math.abs(ry2 - ry1));
+        const scale = 0.85 + 0.15 * drawT;
+        const width = fullW * scale;
+        const height = fullH * scale;
+        const x = cx - width / 2;
+        const y = cy - height / 2;
 
         ctx.beginPath();
         if (typeof ctx.roundRect === "function") {
@@ -331,7 +361,7 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
 
         // Soft translucent fill (0.12 alpha)
         ctx.save();
-        ctx.globalAlpha = alpha * 0.12;
+        ctx.globalAlpha = alpha * 0.12 * drawT;
         ctx.shadowBlur = 0;
         ctx.fill();
         ctx.restore();
@@ -341,14 +371,14 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
       } else if (item.shape === "text" && coords.length >= 2 && item.label) {
         const tx = sx(coords[0]);
         const ty = sy(coords[1]);
-        drawLabelPill(ctx, tx, ty, item.label, stroke, alpha);
+        drawLabelPill(ctx, tx, ty, item.label, stroke, alpha * drawT);
       }
 
       // Optional floating label pill for non-text shapes
-      if (item.shape !== "text" && item.label && coords.length >= 2) {
+      if (item.shape !== "text" && item.label && item.label.trim() && coords.length >= 2) {
         const lx = sx(coords[0]);
         const ly = Math.max(8, sy(coords[1]) - 34);
-        drawLabelPill(ctx, lx, ly, item.label, stroke, alpha);
+        drawLabelPill(ctx, lx, ly, item.label.trim(), stroke, alpha * drawT);
       }
 
       ctx.restore();
@@ -386,9 +416,9 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
       // Filter out completely faded items without triggering redundant React re-renders
       const now = Date.now();
       setItems((prev) => {
-        if (prev.length === 0) return prev;
+        if (prev.length === 0 || guidedModeRef.current) return prev;
         const next = prev.filter(
-          (it) => it.persistent || now - it.createdAt < (it.fadeMs ?? 8000)
+          (it) => it.persistent || now - it.createdAt < (it.fadeMs ?? 14000)
         );
         return next.length === prev.length ? prev : next;
       });

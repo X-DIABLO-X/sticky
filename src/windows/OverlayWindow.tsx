@@ -29,6 +29,12 @@ export const OverlayWindow: React.FC = () => {
   const [showFollower, setShowFollower] = useState(true);
   const [isTalking, setIsTalking] = useState(false);
   const [isDictating, setIsDictating] = useState(false);
+  const [guideHud, setGuideHud] = useState<{
+    active: boolean;
+    step: number;
+    goal: string;
+    instruction: string;
+  }>({ active: false, step: 0, goal: "", instruction: "" });
 
   const handleClearDrawings = useCallback(() => {
     setDrawings([]);
@@ -109,26 +115,15 @@ export const OverlayWindow: React.FC = () => {
       setClearDrawingsSignal((n) => n + 1);
     });
 
-    const unlistenPoint = listenEvent<OverlayPointEvent>("overlay_point", (p) => {
-      setPoint(p);
-    });
-
-    const unlistenDraw = listenEvent<OverlayDrawEvent>("overlay_draw", (d) => {
-      setDrawings((prev) => [...prev, d]);
-    });
-
-    const unlisten3D = listenEvent<Overlay3DEvent>("overlay_3d", (m) => {
-      setModel3D(m);
-    });
-
-    const unlistenWalkthrough = listenEvent<{
-      step: WalkthroughStep;
-      current: number;
-      total: number;
-    }>("walkthrough_step", (payload) => {
-      setWalkthroughStep(payload.step);
-      setWalkthroughIndex(payload.current - 1);
-      setWalkthroughTotal(payload.total);
+    const unlistenGuideState = listenEvent<{
+      active: boolean;
+      step: number;
+      goal: string;
+      instruction: string;
+    }>("guide:state", (payload) => {
+      if (payload) {
+        setGuideHud(payload);
+      }
     });
 
     const unlistenDrive = listenEvent<DriveStatusEvent>("drive_status", (status) => {
@@ -136,11 +131,13 @@ export const OverlayWindow: React.FC = () => {
     });
 
     const unlistenTalk = listenEvent<string>("talk:state", (state) => {
-      setIsTalking(state === "Listening" || state === "Speaking");
+      const s = (state || "").toLowerCase();
+      setIsTalking(s === "listening" || s === "speaking");
     });
 
     const unlistenDict = listenEvent<string>("dictation:state", (state) => {
-      setIsDictating(state === "listening");
+      const s = (state || "").toLowerCase();
+      setIsDictating(s === "recording" || s === "listening");
     });
 
     const unlistenStream = listenEvent<{ textChunk: string }>("ai_stream_chunk", (chunk) => {
@@ -160,10 +157,7 @@ export const OverlayWindow: React.FC = () => {
       unlistenCmd.then((u) => u());
       unlistenPointClear.then((u) => u());
       unlistenClearDrawings.then((u) => u());
-      unlistenPoint.then((u) => u());
-      unlistenDraw.then((u) => u());
-      unlisten3D.then((u) => u());
-      unlistenWalkthrough.then((u) => u());
+      unlistenGuideState.then((u) => u());
       unlistenDrive.then((u) => u());
       unlistenTalk.then((u) => u());
       unlistenDict.then((u) => u());
@@ -212,19 +206,35 @@ export const OverlayWindow: React.FC = () => {
         dictationActive={isDictating}
         aiTarget={point}
         onClearTarget={handleClearTarget}
-        guidedMode={walkthroughStep !== null}
+        guidedMode={guideHud.active || walkthroughStep !== null}
       />
 
       {/* 1. Expressive Vector Whiteboard Canvas & Draw-to-Focus Capture */}
       <DrawingCanvas
         externalDrawings={drawings}
         clearSignal={clearDrawingsSignal}
+        guidedMode={guideHud.active || walkthroughStep !== null}
         onScribbleFocusCrop={(bbox) => {
           console.log("Captured focus crop bbox:", bbox);
           invokeCommand("analyze_screen_region", { bbox });
         }}
         onClearAll={handleClearDrawings}
       />
+
+      {/* Live Step-by-Step Guide HUD Banner */}
+      {guideHud.active && guideHud.instruction && (
+        <div className="fixed bottom-8 left-1/2 -translate-x-1/2 z-50 max-w-xl px-4 py-2.5 rounded-2xl bg-zinc-950/90 border border-emerald-400/45 shadow-[0_8px_32px_rgba(0,0,0,0.65)] backdrop-blur-md pointer-events-none flex items-center gap-3">
+          <span className="shrink-0 px-2 py-0.5 rounded-full bg-emerald-500/20 border border-emerald-400/40 text-[11px] font-bold text-emerald-300 tracking-wide">
+            STEP {guideHud.step}
+          </span>
+          <p className="text-xs font-medium text-zinc-100 leading-snug line-clamp-2">
+            {guideHud.instruction}
+          </p>
+          <span className="shrink-0 text-[10px] text-zinc-400 border-l border-white/10 pl-2.5 whitespace-nowrap">
+            Click target · Esc to exit
+          </span>
+        </div>
+      )}
 
       {/* 2. Interactive Guided Walkthrough Target Box */}
       <GuidedStepBox

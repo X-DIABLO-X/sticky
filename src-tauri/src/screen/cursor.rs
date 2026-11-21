@@ -60,6 +60,7 @@ impl CursorTracker {
             let mut last_click = false;
             let mut is_push_to_talk_active = false;
             let mut press_start_time = std::time::Instant::now();
+            let mut release_started_at: Option<std::time::Instant> = None;
 
             while is_running.load(Ordering::Relaxed) {
                 interval.tick().await;
@@ -80,42 +81,51 @@ impl CursorTracker {
                     }));
                 }
 
-                // 2. Hardware-level Ctrl+Space keyboard detection (Instant Push-To-Talk)
+                // 2. Hardware-level Ctrl+Space keyboard detection (Debounced Push-To-Talk)
                 let ctrl_space = is_ctrl_space_pressed();
 
-                if ctrl_space && !is_push_to_talk_active {
-                    // User pressed and started holding Ctrl + Space
-                    is_push_to_talk_active = true;
-                    press_start_time = std::time::Instant::now();
+                if ctrl_space {
+                    release_started_at = None;
+                    if !is_push_to_talk_active {
+                        is_push_to_talk_active = true;
+                        press_start_time = std::time::Instant::now();
 
-                    println!("\n[Hotkeys] >>> Ctrl+Space HELD: Starting Voice Capture (Speak now)...");
+                        println!("\n[Hotkeys] >>> Ctrl+Space HELD: Starting Voice Capture (Speak now)...");
 
-                    if let Some(app_state) = app.try_state::<AppState>() {
-                        let talk_ctrl = Arc::clone(&app_state.talk_controller);
-                        let app_handle = app.clone();
-                        tauri::async_runtime::spawn(async move {
-                            let _ = WindowManager::show(&app_handle, "bubble");
-                            let _ = WindowManager::position_bubble_at_cursor(&app_handle);
-                            let _ = tauri::Emitter::emit(&app_handle, "hotkey:talk_down", ());
-                            let _ = tauri::Emitter::emit(&app_handle, "cursor:ptt_start", ());
-                            let _ = talk_ctrl.start_talk().await;
-                        });
+                        if let Some(app_state) = app.try_state::<AppState>() {
+                            let talk_ctrl = Arc::clone(&app_state.talk_controller);
+                            talk_ctrl.set_ptt_held(true);
+                            let app_handle = app.clone();
+                            tauri::async_runtime::spawn(async move {
+                                let _ = WindowManager::show(&app_handle, "bubble");
+                                let _ = WindowManager::position_bubble_at_cursor(&app_handle);
+                                let _ = tauri::Emitter::emit(&app_handle, "hotkey:talk_down", ());
+                                let _ = tauri::Emitter::emit(&app_handle, "cursor:ptt_start", ());
+                                let _ = talk_ctrl.start_talk().await;
+                            });
+                        }
                     }
-                } else if !ctrl_space && is_push_to_talk_active {
-                    // User released Ctrl or Space -> Stop recording immediately and submit
-                    is_push_to_talk_active = false;
-                    let held_duration = press_start_time.elapsed();
+                } else if is_push_to_talk_active {
+                    // 180ms key-release debounce + tail grace buffer:
+                    // prevents 1-frame key bounce cutoffs AND preserves the last syllable of speech
+                    let rel = release_started_at.get_or_insert_with(std::time::Instant::now);
+                    if rel.elapsed() >= Duration::from_millis(180) {
+                        is_push_to_talk_active = false;
+                        release_started_at = None;
+                        let held_duration = press_start_time.elapsed();
 
-                    println!("\n[Hotkeys] <<< Ctrl+Space RELEASED (held for {:.2}s): Stopping Voice Capture & Submitting to LLM...", held_duration.as_secs_f32());
+                        println!("\n[Hotkeys] <<< Ctrl+Space RELEASED (held for {:.2}s): Stopping Voice Capture & Submitting to LLM...", held_duration.as_secs_f32());
 
-                    if let Some(app_state) = app.try_state::<AppState>() {
-                        let talk_ctrl = Arc::clone(&app_state.talk_controller);
-                        let app_handle = app.clone();
-                        tauri::async_runtime::spawn(async move {
-                            let _ = tauri::Emitter::emit(&app_handle, "hotkey:talk_up", ());
-                            let _ = tauri::Emitter::emit(&app_handle, "cursor:ptt_stop", ());
-                            let _ = talk_ctrl.stop_talk().await;
-                        });
+                        if let Some(app_state) = app.try_state::<AppState>() {
+                            let talk_ctrl = Arc::clone(&app_state.talk_controller);
+                            talk_ctrl.set_ptt_held(false);
+                            let app_handle = app.clone();
+                            tauri::async_runtime::spawn(async move {
+                                let _ = tauri::Emitter::emit(&app_handle, "hotkey:talk_up", ());
+                                let _ = tauri::Emitter::emit(&app_handle, "cursor:ptt_stop", ());
+                                let _ = talk_ctrl.stop_talk().await;
+                            });
+                        }
                     }
                 }
             }

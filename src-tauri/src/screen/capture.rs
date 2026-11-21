@@ -31,10 +31,21 @@ pub struct GroundedCapture {
 }
 
 impl ScreenCaptureService {
+    fn select_monitor(monitors: &[Monitor], monitor_index: usize) -> Option<&Monitor> {
+        if monitor_index == 0 {
+            monitors
+                .iter()
+                .find(|m| m.is_primary().unwrap_or(false))
+                .or_else(|| monitors.first())
+        } else {
+            monitors.get(monitor_index).or_else(|| monitors.first())
+        }
+    }
+
     /// Returns (origin_x, origin_y, width, height) in physical pixels for the given monitor (defaulting to primary).
     pub fn monitor_bounds(monitor_index: usize) -> (i32, i32, u32, u32) {
         if let Ok(monitors) = Monitor::all() {
-            if let Some(m) = monitors.get(monitor_index).or_else(|| monitors.first()) {
+            if let Some(m) = Self::select_monitor(&monitors, monitor_index) {
                 let x = m.x().unwrap_or(0);
                 let y = m.y().unwrap_or(0);
                 let w = m.width().unwrap_or(1920).max(1);
@@ -55,22 +66,49 @@ impl ScreenCaptureService {
         (0, 0, 1920, 1080)
     }
 
-    /// Returns the top-left origin (vx, vy) of the virtual desktop (important when monitors sit left/above primary).
-    pub fn virtual_desktop_origin() -> (i32, i32) {
+    /// Returns the virtual desktop bounding rect (vx, vy, vw, vh) in physical pixels.
+    pub fn virtual_desktop_bounds() -> (i32, i32, u32, u32) {
         #[cfg(windows)]
         {
             use windows::Win32::UI::WindowsAndMessaging::{
-                GetSystemMetrics, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+                GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+                SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
             };
             unsafe {
-                return (
-                    GetSystemMetrics(SM_XVIRTUALSCREEN),
-                    GetSystemMetrics(SM_YVIRTUALSCREEN),
-                );
+                let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+                let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+                let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN).max(1) as u32;
+                let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN).max(1) as u32;
+                return (vx, vy, vw, vh);
             }
         }
         #[cfg(not(windows))]
-        (0, 0)
+        Self::monitor_bounds(0)
+    }
+
+    /// Returns the top-left origin (vx, vy) of the virtual desktop (important when monitors sit left/above primary).
+    pub fn virtual_desktop_origin() -> (i32, i32) {
+        let (vx, vy, _, _) = Self::virtual_desktop_bounds();
+        (vx, vy)
+    }
+
+    /// Maps monitor-local normalized 0..1000 coordinates into virtual-desktop overlay 0..1000 coordinates.
+    /// On a single monitor this is the identity transform; on multi-monitor desktops it removes cross-screen drift.
+    pub fn monitor_to_overlay_norm(nx: i32, ny: i32, monitor_index: usize) -> (i32, i32) {
+        let (mx, my, mw, mh) = Self::monitor_bounds(monitor_index);
+        let (vx, vy, vw, vh) = Self::virtual_desktop_bounds();
+        if mx == vx && my == vy && mw == vw && mh == vh {
+            return (nx.clamp(0, 1000), ny.clamp(0, 1000));
+        }
+        let px = mx as f64 + (nx.clamp(0, 1000) as f64 / 1000.0) * mw as f64;
+        let py = my as f64 + (ny.clamp(0, 1000) as f64 / 1000.0) * mh as f64;
+        let ox = (((px - vx as f64) / vw.max(1) as f64) * 1000.0)
+            .round()
+            .clamp(0.0, 1000.0) as i32;
+        let oy = (((py - vy as f64) / vh.max(1) as f64) * 1000.0)
+            .round()
+            .clamp(0.0, 1000.0) as i32;
+        (ox, oy)
     }
 
     /// Converts normalized 0..1000 coordinates into exact physical screen pixels on `monitor_index`.
@@ -222,8 +260,7 @@ impl ScreenCaptureService {
         let monitors = Monitor::all()
             .map_err(|e| AppError::Screen(format!("Failed to enumerate monitors: {}", e)))?;
 
-        let monitor = monitors
-            .get(monitor_index)
+        let monitor = Self::select_monitor(&monitors, monitor_index)
             .ok_or_else(|| AppError::Screen(format!("Monitor index {} out of range", monitor_index)))?;
 
         let mon_x = monitor.x().unwrap_or(0);
@@ -237,8 +274,13 @@ impl ScreenCaptureService {
 
         // 1. Run WinRT OCR on the FULL-RES image for maximum text detection accuracy
         let ocr_words = crate::screen::ocr::extract_ocr_words(&img);
+        let ocr_raw_boxes: Vec<[i32; 4]> = ocr_words.iter().map(|w| w.bbox).collect();
 
-        let mut elements: Vec<DetectedElement> = Vec::with_capacity(ocr_words.len() + a11y_nodes.len());
+        // 1b. Run classical CV icon detector on FULL-RES image to capture unlabeled toolbar buttons & gizmos
+        let icon_boxes = crate::screen::regions::detect_icon_regions(&img, &ocr_raw_boxes, 55);
+
+        let mut elements: Vec<DetectedElement> =
+            Vec::with_capacity(ocr_words.len() + a11y_nodes.len() + icon_boxes.len());
 
         for word in ocr_words {
             let label = word.text.trim();
@@ -309,11 +351,34 @@ impl ScreenCaptureService {
             }
         }
 
+        // 2b. Merge CV-detected icon regions (skip any already covered by an A11y button)
+        for ibox in icon_boxes {
+            let (bbox_norm, center_norm) =
+                Self::physical_bbox_to_normalized(ibox, 0, 0, orig_w, orig_h);
+            if bbox_norm[2] <= bbox_norm[0] || bbox_norm[3] <= bbox_norm[1] {
+                continue;
+            }
+            let is_dup = elements.iter().any(|existing| {
+                let dx = (existing.center_norm[0] - center_norm[0]).abs();
+                let dy = (existing.center_norm[1] - center_norm[1]).abs();
+                dx <= 10 && dy <= 10
+            });
+            if !is_dup {
+                elements.push(DetectedElement {
+                    id: 0,
+                    label: "icon".to_string(),
+                    source: "icon".to_string(),
+                    bbox_norm,
+                    center_norm,
+                });
+            }
+        }
+
         // 3. Sort top-to-bottom (8-unit row bands), left-to-right so menus & toolbars always come first
         elements.sort_by_key(|el| (el.bbox_norm[1] / 8, el.bbox_norm[0]));
 
-        // 4. Cap to top 140 elements and assign sequential 1-based IDs
-        elements.truncate(140);
+        // 4. Cap to top 150 elements and assign sequential 1-based IDs
+        elements.truncate(150);
         for (idx, el) in elements.iter_mut().enumerate() {
             el.id = (idx + 1) as u32;
         }
@@ -501,8 +566,8 @@ fn draw_label_pill(
     }
 }
 
-/// Draws a 0-1000 normalized coordinate grid, ruler ticks, and bitmap coordinate labels
-/// directly onto `img` for Vision-Language Model spatial grounding.
+/// Draws a subtle 0-1000 normalized coordinate grid, border ruler ticks, and compact edge labels
+/// directly onto `img` without obscuring the top/left application menu bars.
 pub fn draw_coordinate_grid(img: &mut RgbaImage) {
     let w = img.width() as i32;
     let h = img.height() as i32;
@@ -510,16 +575,15 @@ pub fn draw_coordinate_grid(img: &mut RgbaImage) {
         return;
     }
 
-    let grid_rgb = (0u8, 240u8, 210u8); // Bright cyan-emerald
-    let label_rgb = (110u8, 255u8, 235u8);
-    let scale = if w >= 900 { 2 } else { 1 };
-    let dash_len = 5;
-    let dash_period = 10;
+    let grid_rgb = (0u8, 225u8, 200u8); // Subtle cyan-emerald
+    let label_rgb = (130u8, 255u8, 235u8);
+    let dash_len = 4;
+    let dash_period = 12;
 
-    // 1. Major dashed grid lines at 100..=900
+    // 1. Subtle dashed grid lines at 100..=900 so UI text and SoM boxes remain crystal-clear
     for step in (100..=900).step_by(100) {
         let is_center = step == 500;
-        let line_alpha = if is_center { 0.65 } else { 0.48 };
+        let line_alpha = if is_center { 0.28 } else { 0.17 };
 
         let gx = (((step as f64) / 1000.0) * w as f64).round() as i32;
         for y in 0..h {
@@ -536,85 +600,74 @@ pub fn draw_coordinate_grid(img: &mut RgbaImage) {
         }
     }
 
-    // 2. Minor ruler tick marks along top and left borders at 50, 150, ..., 950
-    let tick_len = 7 * scale;
+    // 2. Crisp minor ruler tick marks along top & bottom and left & right borders at 50..=950
+    let tick_len = 6;
     for step in (50..=950).step_by(100) {
         let tx = (((step as f64) / 1000.0) * w as f64).round() as i32;
         for dy in 0..tick_len {
-            blend_pixel(img, tx, dy, grid_rgb.0, grid_rgb.1, grid_rgb.2, 0.85);
-            if scale > 1 {
-                blend_pixel(img, tx + 1, dy, grid_rgb.0, grid_rgb.1, grid_rgb.2, 0.85);
-            }
+            blend_pixel(img, tx, dy, grid_rgb.0, grid_rgb.1, grid_rgb.2, 0.7);
+            blend_pixel(img, tx, h - 1 - dy, grid_rgb.0, grid_rgb.1, grid_rgb.2, 0.7);
         }
 
         let ty = (((step as f64) / 1000.0) * h as f64).round() as i32;
         for dx in 0..tick_len {
-            blend_pixel(img, dx, ty, grid_rgb.0, grid_rgb.1, grid_rgb.2, 0.85);
-            if scale > 1 {
-                blend_pixel(img, dx, ty + 1, grid_rgb.0, grid_rgb.1, grid_rgb.2, 0.85);
-            }
+            blend_pixel(img, dx, ty, grid_rgb.0, grid_rgb.1, grid_rgb.2, 0.7);
+            blend_pixel(img, w - 1 - dx, ty, grid_rgb.0, grid_rgb.1, grid_rgb.2, 0.7);
         }
     }
 
-    // 3. Bold, high-contrast coordinate labels along top edge (X) and left edge (Y)
-    let pill_w_3digits = (3 * 5 * scale) + (2 * scale) + (6 * scale);
-    let pill_h = (7 * scale) + (4 * scale);
+    // 3. Compact scale=1 coordinate labels along BOTTOM edge (X) and RIGHT edge (Y)
+    //    so top-left app menus (File/Edit/View/Select/Add/Object) & left toolbars are NEVER covered!
+    let pill_w_3digits = (3 * 5) + 2 + 6;
+    let pill_h = 7 + 4;
 
     for step in (100..=900).step_by(100) {
         let label = step.to_string();
 
-        // Top ruler X label centered on gx
         let gx = (((step as f64) / 1000.0) * w as f64).round() as i32;
         draw_label_pill(
             img,
             &label,
             gx - pill_w_3digits / 2,
-            2,
-            scale,
-            0.80,
+            h - pill_h - 2,
+            1,
+            0.78,
             label_rgb,
         );
 
-        // Left ruler Y label centered on gy
         let gy = (((step as f64) / 1000.0) * h as f64).round() as i32;
         draw_label_pill(
             img,
             &label,
-            2,
+            w - pill_w_3digits - 2,
             gy - pill_h / 2,
-            scale,
-            0.80,
+            1,
+            0.78,
             label_rgb,
         );
     }
 
-    // 4. Center (500, 500) crosshair & subtle intersection label
+    // 4. Subtle center (500, 500) crosshair
     let cx = w / 2;
     let cy = h / 2;
-    let arm = 6 * scale;
+    let arm = 6;
     for d in -arm..=arm {
-        blend_pixel(img, cx + d, cy, 255, 255, 255, 0.85);
-        blend_pixel(img, cx, cy + d, 255, 255, 255, 0.85);
+        blend_pixel(img, cx + d, cy, 255, 255, 255, 0.65);
+        blend_pixel(img, cx, cy + d, 255, 255, 255, 0.65);
     }
-    draw_label_pill(
-        img,
-        "500,500",
-        cx + 6,
-        cy + 6,
-        1,
-        0.65,
-        label_rgb,
-    );
 }
 
-/// Draws crisp Set-of-Mark (SoM) bounding boxes and compact `[id]` badges for every `DetectedElement`
-/// directly onto `img` so the VLM can visually read exact element `#id`s.
+/// Draws crisp Set-of-Mark (SoM) bounding boxes and collision-free `[id]` badges for every
+/// `DetectedElement` directly onto `img` so the VLM can visually read exact element `#id`s.
 pub fn draw_som_overlays(img: &mut RgbaImage, elements: &[DetectedElement]) {
     let w = img.width() as i32;
     let h = img.height() as i32;
     if w < 16 || h < 16 || elements.is_empty() {
         return;
     }
+
+    // Track placed tag rects `[x, y, w, h]` so adjacent menu items never overlap their `#id` badges
+    let mut placed_tags: Vec<[i32; 4]> = Vec::with_capacity(elements.len());
 
     for el in elements {
         let px1 = (((el.bbox_norm[0] as f64) / 1000.0) * w as f64).round() as i32;
@@ -627,15 +680,15 @@ pub fn draw_som_overlays(img: &mut RgbaImage, elements: &[DetectedElement]) {
         let x2 = px2.clamp(x1, w - 1);
         let y2 = py2.clamp(y1, h - 1);
 
-        // Emerald for OCR elements, Amber for UIA (a11y) elements
-        let (r, g, b) = if el.source == "a11y" {
-            (251u8, 191u8, 36u8) // Amber
-        } else {
-            (34u8, 211u8, 153u8) // Emerald
+        // Color-coded by source: Emerald = OCR text, Amber = UIA control, Sky-Blue = CV icon
+        let (r, g, b) = match el.source.as_str() {
+            "a11y" => (251u8, 191u8, 36u8), // Amber
+            "icon" => (56u8, 189u8, 248u8), // Sky-Blue
+            _ => (34u8, 211u8, 153u8),      // Emerald
         };
 
         // 1px crisp bounding box
-        let box_alpha = 0.82;
+        let box_alpha = 0.85;
         for x in x1..=x2 {
             blend_pixel(img, x, y1, r, g, b, box_alpha);
             blend_pixel(img, x, y2, r, g, b, box_alpha);
@@ -645,22 +698,31 @@ pub fn draw_som_overlays(img: &mut RgbaImage, elements: &[DetectedElement]) {
             blend_pixel(img, x2, y, r, g, b, box_alpha);
         }
 
-        // Tiny dark-backed numeric ID tag at the top-left corner of the box
+        // Collision-free numeric ID badge anchored to the box
         let id_text = el.id.to_string();
-        draw_compact_som_tag(img, &id_text, x1, y1, (r, g, b));
+        if let Some(tag_rect) = draw_compact_som_tag(img, &id_text, x1, y1, x2, y2, (r, g, b), &placed_tags) {
+            placed_tags.push(tag_rect);
+        }
     }
+}
+
+fn rects_overlap(a: &[i32; 4], b: &[i32; 4]) -> bool {
+    a[0] < b[0] + b[2] && a[0] + a[2] > b[0] && a[1] < b[1] + b[3] && a[1] + a[3] > b[1]
 }
 
 fn draw_compact_som_tag(
     img: &mut RgbaImage,
     text: &str,
-    box_x: i32,
-    box_y: i32,
+    x1: i32,
+    y1: i32,
+    x2: i32,
+    y2: i32,
     fg_rgb: (u8, u8, u8),
-) {
+    placed_tags: &[[i32; 4]],
+) -> Option<[i32; 4]> {
     let char_count = text.chars().count() as i32;
     if char_count == 0 {
-        return;
+        return None;
     }
     let glyph_w = 5;
     let glyph_h = 7;
@@ -672,23 +734,42 @@ fn draw_compact_som_tag(
     let tag_w = text_w + pad_x * 2;
     let tag_h = glyph_h + pad_y * 2;
 
-    // Prefer sitting just above the top-left corner so it doesn't cover the button text;
-    // fall back to inside top-left if near the top edge of the screen.
-    let preferred_y = if box_y >= tag_h { box_y - tag_h } else { box_y };
     let max_x = (img.width() as i32 - tag_w).max(0);
     let max_y = (img.height() as i32 - tag_h).max(0);
-    let tx = box_x.clamp(0, max_x);
-    let ty = preferred_y.clamp(0, max_y);
+
+    // Candidate anchor positions in priority order: above-left, below-left, right-top, left-top, above-right, below-right
+    let candidates = [
+        (x1, y1 - tag_h - 1),
+        (x1, y2 + 1),
+        (x2 + 1, y1),
+        (x1 - tag_w - 1, y1),
+        (x2 - tag_w, y1 - tag_h - 1),
+        (x2 - tag_w, y2 + 1),
+    ];
+
+    let mut chosen = [x1.clamp(0, max_x), (y1 - tag_h).clamp(0, max_y), tag_w, tag_h];
+    for (cx, cy) in candidates {
+        if cx < 0 || cy < 0 || cx > max_x || cy > max_y {
+            continue;
+        }
+        let rect = [cx, cy, tag_w, tag_h];
+        if !placed_tags.iter().any(|p| rects_overlap(&rect, p)) {
+            chosen = rect;
+            break;
+        }
+    }
+
+    let (tx, ty) = (chosen[0], chosen[1]);
 
     // Dark high-contrast pill background + 1px accent border
-    draw_filled_rect(img, tx, ty, tag_w, tag_h, 8, 12, 18, 0.88);
+    draw_filled_rect(img, tx, ty, tag_w, tag_h, 6, 10, 16, 0.92);
     for dx in 1..(tag_w - 1) {
-        blend_pixel(img, tx + dx, ty, fg_rgb.0, fg_rgb.1, fg_rgb.2, 0.80);
-        blend_pixel(img, tx + dx, ty + tag_h - 1, fg_rgb.0, fg_rgb.1, fg_rgb.2, 0.80);
+        blend_pixel(img, tx + dx, ty, fg_rgb.0, fg_rgb.1, fg_rgb.2, 0.90);
+        blend_pixel(img, tx + dx, ty + tag_h - 1, fg_rgb.0, fg_rgb.1, fg_rgb.2, 0.90);
     }
     for dy in 1..(tag_h - 1) {
-        blend_pixel(img, tx, ty + dy, fg_rgb.0, fg_rgb.1, fg_rgb.2, 0.80);
-        blend_pixel(img, tx + tag_w - 1, ty + dy, fg_rgb.0, fg_rgb.1, fg_rgb.2, 0.80);
+        blend_pixel(img, tx, ty + dy, fg_rgb.0, fg_rgb.1, fg_rgb.2, 0.90);
+        blend_pixel(img, tx + tag_w - 1, ty + dy, fg_rgb.0, fg_rgb.1, fg_rgb.2, 0.90);
     }
 
     // Crisp 5x7 bitmap digits
@@ -714,6 +795,8 @@ fn draw_compact_som_tag(
         }
         cursor_x += glyph_w + spacing;
     }
+
+    Some(chosen)
 }
 
 #[cfg(test)]

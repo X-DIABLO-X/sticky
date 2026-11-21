@@ -39,11 +39,24 @@ pub struct TalkController {
     current_state: Arc<Mutex<TalkState>>,
     cancel_flag: Arc<AtomicBool>,
     op_lock: Arc<Mutex<()>>,
+    ptt_held: Arc<AtomicBool>,
     guide_active: Arc<AtomicBool>,
     guide_goal: Arc<Mutex<String>>,
     guide_step: Arc<Mutex<usize>>,
     guide_history: Arc<Mutex<Vec<ChatMessage>>>,
     guide_session_id: Arc<AtomicU64>,
+}
+
+fn emit_guide_state(app: &AppHandle, active: bool, step: usize, goal: &str, instruction: &str) {
+    let _ = app.emit(
+        "guide:state",
+        serde_json::json!({
+            "active": active,
+            "step": step,
+            "goal": goal,
+            "instruction": instruction
+        }),
+    );
 }
 
 fn emit_activity_log(app: &AppHandle, category: &str, title: &str, message: &str) {
@@ -209,51 +222,58 @@ fn broadcast_overlay_command(
         _ => {}
     }
 
-    if !matches!(cmd, OverlayCommand::Guide { .. }) {
-        let _ = app.emit("overlay:command", cmd);
-    }
+    // Transform monitor-local 0..1000 coords into virtual-desktop overlay 0..1000 coords (identity on 1 monitor)
+    // and emit a SINGLE canonical `overlay:command` event (eliminates duplicate draws & double glide restarts).
     match cmd {
-        OverlayCommand::Point { x, y, label, screen: _ } => {
-            let _ = app.emit(
-                "overlay_point",
-                serde_json::json!({ "x": x, "y": y, "label": label, "screenIndex": 0, "durationMs": 1500 }),
-            );
+        OverlayCommand::Point { x, y, label, screen } => {
+            let (ox, oy) = ScreenCaptureService::monitor_to_overlay_norm(*x, *y, 0);
+            let mapped = OverlayCommand::Point {
+                x: ox,
+                y: oy,
+                label: label.clone(),
+                screen: screen.clone(),
+            };
+            let _ = app.emit("overlay:command", &mapped);
         }
         OverlayCommand::Draw { shape, coords, color, label } => {
-            let _ = app.emit(
-                "overlay_draw",
-                serde_json::json!({
-                    "id": format!("draw_{}", uuid::Uuid::new_v4()),
-                    "shape": shape,
-                    "coords": coords,
-                    "color": color.as_deref().unwrap_or("#10b981"),
-                    "label": label
-                }),
-            );
-        }
-        OverlayCommand::Model3D { model, title } => {
-            let _ = app.emit(
-                "overlay_3d",
-                serde_json::json!({
-                    "id": format!("3d_{}", uuid::Uuid::new_v4()),
-                    "title": title,
-                    "geometryType": model,
-                    "visible": true
-                }),
-            );
+            let mapped_coords = if shape == "circle" && coords.len() >= 3 {
+                let (ox, oy) = ScreenCaptureService::monitor_to_overlay_norm(coords[0], coords[1], 0);
+                vec![ox, oy, coords[2]]
+            } else {
+                let mut out = Vec::with_capacity(coords.len());
+                let mut i = 0;
+                while i + 1 < coords.len() {
+                    let (ox, oy) = ScreenCaptureService::monitor_to_overlay_norm(coords[i], coords[i + 1], 0);
+                    out.push(ox);
+                    out.push(oy);
+                    i += 2;
+                }
+                if i < coords.len() {
+                    out.push(coords[i]);
+                }
+                out
+            };
+            let mapped = OverlayCommand::Draw {
+                shape: shape.clone(),
+                coords: mapped_coords,
+                color: Some(color.clone().unwrap_or_else(|| "#10b981".to_string())),
+                label: label.clone(),
+            };
+            let _ = app.emit("overlay:command", &mapped);
         }
         OverlayCommand::Step { index, total, bbox, instruction } => {
-            let _ = app.emit(
-                "walkthrough_step",
-                serde_json::json!({
-                    "step": { "step": index, "instruction": instruction, "bbox": bbox },
-                    "current": index,
-                    "total": total
-                }),
-            );
+            let (ox1, oy1) = ScreenCaptureService::monitor_to_overlay_norm(bbox[0], bbox[1], 0);
+            let (ox2, oy2) = ScreenCaptureService::monitor_to_overlay_norm(bbox[2], bbox[3], 0);
+            let mapped = OverlayCommand::Step {
+                index: *index,
+                total: *total,
+                bbox: [ox1, oy1, ox2, oy2],
+                instruction: instruction.clone(),
+            };
+            let _ = app.emit("overlay:command", &mapped);
         }
-        OverlayCommand::ClearDrawings => {
-            let _ = app.emit("overlay:clear_drawings", ());
+        OverlayCommand::Model3D { .. } | OverlayCommand::ClearDrawings => {
+            let _ = app.emit("overlay:command", cmd);
         }
         OverlayCommand::Guide { .. }
         | OverlayCommand::PointRef { .. }
@@ -335,12 +355,17 @@ impl TalkController {
             current_state: Arc::new(Mutex::new(TalkState::Idle)),
             cancel_flag: Arc::new(AtomicBool::new(false)),
             op_lock: Arc::new(Mutex::new(())),
+            ptt_held: Arc::new(AtomicBool::new(false)),
             guide_active: Arc::new(AtomicBool::new(false)),
             guide_goal: Arc::new(Mutex::new(String::new())),
             guide_step: Arc::new(Mutex::new(0)),
             guide_history: Arc::new(Mutex::new(Vec::new())),
             guide_session_id: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    pub fn set_ptt_held(&self, held: bool) {
+        self.ptt_held.store(held, Ordering::SeqCst);
     }
 
     pub async fn get_state(&self) -> TalkState {
@@ -364,7 +389,9 @@ impl TalkController {
         let _guard = self.op_lock.lock().await;
 
         // Cancel any active step-by-step guide loop when the user starts a new voice query
-        self.guide_active.store(false, Ordering::SeqCst);
+        if self.guide_active.swap(false, Ordering::SeqCst) {
+            emit_guide_state(&self.app_handle, false, 0, "", "");
+        }
         self.guide_session_id.fetch_add(1, Ordering::SeqCst);
 
         let needs_barge_in = {
@@ -420,6 +447,7 @@ impl TalkController {
 
         let audio_engine_clone = Arc::clone(&self.audio_engine);
         let state_clone = Arc::clone(&self.current_state);
+        let ptt_held_clone = Arc::clone(&self.ptt_held);
         let app_handle_clone = self.app_handle.clone();
 
         tauri::async_runtime::spawn(async move {
@@ -456,20 +484,24 @@ impl TalkController {
                 }
 
                 let elapsed = start_time.elapsed();
-                let trailing_hit = speech_detected
+                let is_ptt_held = ptt_held_clone.load(Ordering::SeqCst);
+
+                // While Ctrl+Space Push-to-Talk is actively held, NEVER auto-stop on thinking pauses!
+                let trailing_hit = !is_ptt_held
+                    && speech_detected
                     && silence_start
-                        .map(|s| s.elapsed() >= Duration::from_millis(1400))
+                        .map(|s| s.elapsed() >= Duration::from_millis(2200))
                         .unwrap_or(false);
-                let initial_hit = !speech_detected && elapsed >= Duration::from_millis(6000);
-                let max_hit = elapsed >= Duration::from_millis(30000);
+                let initial_hit = !is_ptt_held && !speech_detected && elapsed >= Duration::from_millis(8000);
+                let max_hit = elapsed >= Duration::from_millis(60000);
 
                 if trailing_hit || initial_hit || max_hit {
                     if trailing_hit {
-                        emit_activity_log(&app_handle_clone, "talk", "Speech Ended", "Silence detected after speech; transcribing audio...");
+                        emit_activity_log(&app_handle_clone, "talk", "Speech Ended", "2.2s silence detected; transcribing audio...");
                     } else if initial_hit {
-                        emit_activity_log(&app_handle_clone, "talk", "Silence Timeout", "No speech detected within 6 seconds.");
+                        emit_activity_log(&app_handle_clone, "talk", "Silence Timeout", "No speech detected within 8 seconds.");
                     } else if max_hit {
-                        emit_activity_log(&app_handle_clone, "talk", "Max Duration (30s)", "Audio buffer reached 30 second limit.");
+                        emit_activity_log(&app_handle_clone, "talk", "Max Duration (60s)", "Audio buffer reached 60 second limit.");
                     }
                     if let Some(app_state) = app_handle_clone.try_state::<AppState>() {
                         let _ = app_state.talk_controller.stop_talk().await;
@@ -660,10 +692,11 @@ impl TalkController {
             {
                 let mut history = self.guide_history.lock().await;
                 history.clear();
-                history.push(ChatMessage::user(transcript));
-                history.push(ChatMessage::assistant(full_reply));
+                history.push(ChatMessage::user(transcript.clone()));
+                history.push(ChatMessage::assistant(full_reply.clone()));
             }
             self.guide_active.store(true, Ordering::SeqCst);
+            emit_guide_state(&self.app_handle, true, 1, &transcript, full_reply.trim());
             emit_activity_log(
                 &self.app_handle,
                 "talk",
@@ -674,6 +707,7 @@ impl TalkController {
         } else {
             if guide_signal == Some(false) {
                 self.guide_active.store(false, Ordering::SeqCst);
+                emit_guide_state(&self.app_handle, false, 0, "", "");
                 let _ = self.app_handle.emit("overlay:point_clear", ());
                 let _ = self.app_handle.emit("overlay:clear_drawings", ());
             }
@@ -733,6 +767,7 @@ impl TalkController {
                     };
                     if esc_down {
                         guide_active.store(false, Ordering::SeqCst);
+                        emit_guide_state(&app_handle, false, 0, "", "");
                         let _ = app_handle.emit("overlay:point_clear", ());
                         let _ = app_handle.emit("overlay:clear_drawings", ());
                         emit_activity_log(
@@ -927,7 +962,7 @@ impl TalkController {
                 "I clicked at ({}, {}) for step {}.",
                 click_x, click_y, step_num
             )));
-            history.push(ChatMessage::assistant(full_reply));
+            history.push(ChatMessage::assistant(full_reply.clone()));
         }
 
         {
@@ -940,9 +975,11 @@ impl TalkController {
             && self.guide_active.load(Ordering::SeqCst)
             && !self.cancel_flag.load(Ordering::Relaxed)
         {
+            emit_guide_state(&self.app_handle, true, step_num, &goal, full_reply.trim());
             self.spawn_guide_click_watcher();
         } else {
             self.guide_active.store(false, Ordering::SeqCst);
+            emit_guide_state(&self.app_handle, false, 0, "", "");
             let _ = self.app_handle.emit("overlay:point_clear", ());
             let _ = self.app_handle.emit("overlay:clear_drawings", ());
             emit_activity_log(

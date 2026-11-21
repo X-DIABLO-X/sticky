@@ -21,12 +21,12 @@ import { listenEvent } from "../../lib/ipc";
 import { Badge, Button, Card } from "../ui/primitives";
 import { toast } from "sonner";
 
-export type LogCategory = "all" | "talk" | "stt" | "llm" | "tts" | "error" | "system";
+export type LogCategory = "all" | "talk" | "stt" | "llm" | "tts" | "overlay" | "error" | "system";
 
 export interface LogEntry {
   id: string;
   timestamp: string;
-  category: "talk" | "stt" | "llm" | "tts" | "error" | "system";
+  category: "talk" | "stt" | "llm" | "tts" | "overlay" | "error" | "system";
   title: string;
   content: string;
 }
@@ -51,6 +51,11 @@ const CATEGORY_STYLES: Record<string, { label: string; badgeClass: string; icon:
     label: "TTS",
     badgeClass: "bg-amber-500/15 text-amber-400 border border-amber-500/30",
     icon: <Volume2 className="w-3 h-3 text-amber-400" />,
+  },
+  overlay: {
+    label: "SOM",
+    badgeClass: "bg-teal-500/15 text-teal-300 border border-teal-500/30",
+    icon: <Activity className="w-3 h-3 text-teal-300" />,
   },
   error: {
     label: "ERROR",
@@ -175,7 +180,7 @@ export const LiveLogs: React.FC = () => {
 
   // Category counts
   const counts = useMemo(() => {
-    const c: Record<string, number> = { all: logs.length, talk: 0, stt: 0, llm: 0, tts: 0, error: 0 };
+    const c: Record<string, number> = { all: logs.length, talk: 0, stt: 0, llm: 0, tts: 0, overlay: 0, error: 0 };
     logs.forEach((l) => {
       if (c[l.category] !== undefined) c[l.category]++;
     });
@@ -214,7 +219,7 @@ export const LiveLogs: React.FC = () => {
       {/* Top Filter and Controls Bar */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-1.5 flex-wrap">
-          {(["all", "talk", "stt", "llm", "tts", "error"] as LogCategory[]).map((cat) => {
+          {(["all", "talk", "stt", "llm", "tts", "overlay", "error"] as LogCategory[]).map((cat) => {
             const isSelected = categoryFilter === cat;
             return (
               <button

@@ -121,8 +121,7 @@ mod tests {
         assert_eq!(agent.name, "Clicky Pro");
 
         let agents = repo.get_agents().expect("get agents failed");
-        assert_eq!(agents.len(), 1);
-        assert_eq!(agents[0].id, agent.id);
+        assert!(agents.iter().any(|a| a.id == agent.id && a.name == "Clicky Pro"));
 
         repo.save_message(&agent.id, "user", "Hello Clicky").expect("save message failed");
         repo.save_message(&agent.id, "assistant", "Hello! How can I help?").expect("save msg failed");

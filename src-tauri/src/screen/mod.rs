@@ -3,6 +3,7 @@ pub mod capture;
 pub mod cursor;
 pub mod input;
 pub mod ocr;
+pub mod regions;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
