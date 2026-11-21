@@ -10,12 +10,19 @@ export interface OverlayPointEvent {
   durationMs?: number;
 }
 
-export type DrawShape = 'circle' | 'box' | 'arrow' | 'scribble';
+export type DrawShape =
+  | "line"
+  | "arrow"
+  | "curve"
+  | "polygon"
+  | "circle"
+  | "box"
+  | "text";
 
 export interface OverlayDrawEvent {
   id?: string;
   shape: DrawShape;
-  coords: number[]; // e.g. [cx, cy, r] for circle, [x1, y1, x2, y2] for box/arrow
+  coords: number[]; // Normalized 0..1000: line/arrow/box [x1,y1,x2,y2], curve [x1,y1,cx,cy,x2,y2], polygon [x1,y1,...], circle [cx,cy,r], text [x,y]
   label?: string;
   color?: string;
   fadeMs?: number; // Default 8000ms

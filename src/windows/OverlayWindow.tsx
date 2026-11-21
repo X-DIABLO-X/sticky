@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from "react";
-import { listenEvent, setIgnoreCursorEvents, invokeCommand, dispatchMockEvent } from "../lib/ipc";
+import React, { useState, useEffect, useCallback } from "react";
+import { listenEvent, setIgnoreCursorEvents, invokeCommand } from "../lib/ipc";
 import type {
   OverlayPointEvent,
   OverlayDrawEvent,
@@ -8,7 +8,6 @@ import type {
   DriveStatusEvent,
   DriveConfirmationPayload,
 } from "../types/events";
-import { AnimatedPointer } from "../components/overlay/AnimatedPointer";
 import { DrawingCanvas } from "../components/overlay/DrawingCanvas";
 import { GuidedStepBox } from "../components/overlay/GuidedStepBox";
 import { DriveBorder } from "../components/overlay/DriveBorder";
@@ -20,6 +19,7 @@ import { Sparkles, Eye, ShieldAlert, Navigation, Edit3, Box } from "lucide-react
 export const OverlayWindow: React.FC = () => {
   const [point, setPoint] = useState<OverlayPointEvent | null>(null);
   const [drawings, setDrawings] = useState<OverlayDrawEvent[]>([]);
+  const [clearDrawingsSignal, setClearDrawingsSignal] = useState(0);
   const [model3D, setModel3D] = useState<Overlay3DEvent | null>(null);
   const [walkthroughStep, setWalkthroughStep] = useState<WalkthroughStep | null>(null);
   const [walkthroughIndex, setWalkthroughIndex] = useState(0);
@@ -29,6 +29,15 @@ export const OverlayWindow: React.FC = () => {
   const [showFollower, setShowFollower] = useState(true);
   const [isTalking, setIsTalking] = useState(false);
   const [isDictating, setIsDictating] = useState(false);
+
+  const handleClearDrawings = useCallback(() => {
+    setDrawings([]);
+    setClearDrawingsSignal((n) => n + 1);
+  }, []);
+
+  const handleClearTarget = useCallback(() => {
+    setPoint(null);
+  }, []);
 
   // Initialize click-through hit-testing on mount
   useEffect(() => {
@@ -55,19 +64,24 @@ export const OverlayWindow: React.FC = () => {
           x: cmd.payload.x,
           y: cmd.payload.y,
           label: cmd.payload.label || "Target",
-          screenIndex: 0,
-          durationMs: 1500,
+          durationMs: cmd.payload.durationMs ?? 460,
         });
       } else if (cmd.type === "Draw" && cmd.payload) {
         setDrawings((prev) => [
           ...prev,
           {
-            id: `draw_${Date.now()}_${Math.random()}`,
+            id: cmd.payload.id || `draw_${Date.now()}_${Math.random()}`,
             shape: cmd.payload.shape || "box",
             coords: cmd.payload.coords || [200, 200, 400, 400],
-            color: cmd.payload.color || "#38bdf8",
+            label: cmd.payload.label,
+            color: cmd.payload.color || "#10b981",
+            fadeMs: cmd.payload.fadeMs,
+            persistent: cmd.payload.persistent,
           },
         ]);
+      } else if (cmd.type === "ClearDrawings") {
+        setDrawings([]);
+        setClearDrawingsSignal((n) => n + 1);
       } else if (cmd.type === "Model3D" && cmd.payload) {
         setModel3D({
           id: `3d_${Date.now()}`,
@@ -84,6 +98,15 @@ export const OverlayWindow: React.FC = () => {
         setWalkthroughIndex((cmd.payload.index || 1) - 1);
         setWalkthroughTotal(cmd.payload.total || 1);
       }
+    });
+
+    const unlistenPointClear = listenEvent("overlay:point_clear", () => {
+      setPoint(null);
+    });
+
+    const unlistenClearDrawings = listenEvent("overlay:clear_drawings", () => {
+      setDrawings([]);
+      setClearDrawingsSignal((n) => n + 1);
     });
 
     const unlistenPoint = listenEvent<OverlayPointEvent>("overlay_point", (p) => {
@@ -135,6 +158,8 @@ export const OverlayWindow: React.FC = () => {
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
       unlistenCmd.then((u) => u());
+      unlistenPointClear.then((u) => u());
+      unlistenClearDrawings.then((u) => u());
       unlistenPoint.then((u) => u());
       unlistenDraw.then((u) => u());
       unlisten3D.then((u) => u());
@@ -180,27 +205,28 @@ export const OverlayWindow: React.FC = () => {
 
   return (
     <div className="relative w-screen h-screen overflow-hidden select-none pointer-events-none bg-transparent">
-      {/* Real-time Cursor Follower Companion */}
+      {/* Unified Single HeyClicky Emerald Cursor (User Follow + AI Pointing) */}
       <CursorFollower
         enabled={showFollower}
         talkActive={isTalking}
         dictationActive={isDictating}
+        aiTarget={point}
+        onClearTarget={handleClearTarget}
+        guidedMode={walkthroughStep !== null}
       />
 
-      {/* 1. Excalidraw Sketchy Canvas & Draw-to-Focus Capture */}
+      {/* 1. Expressive Vector Whiteboard Canvas & Draw-to-Focus Capture */}
       <DrawingCanvas
         externalDrawings={drawings}
+        clearSignal={clearDrawingsSignal}
         onScribbleFocusCrop={(bbox) => {
           console.log("Captured focus crop bbox:", bbox);
           invokeCommand("analyze_screen_region", { bbox });
         }}
-        onClearAll={() => setDrawings([])}
+        onClearAll={handleClearDrawings}
       />
 
-      {/* 2. Bezier Animated Glowing Pointer */}
-      <AnimatedPointer point={point} onAnimationEnd={() => console.log("Pointer reached target")} />
-
-      {/* 3. Interactive Guided Walkthrough Target Box */}
+      {/* 2. Interactive Guided Walkthrough Target Box */}
       <GuidedStepBox
         step={walkthroughStep}
         currentStepIndex={walkthroughIndex}
@@ -210,7 +236,7 @@ export const OverlayWindow: React.FC = () => {
         onClose={() => setWalkthroughStep(null)}
       />
 
-      {/* 4. Drive Mode Glowing Perimeter Border & Confirmation Modal */}
+      {/* 3. Drive Mode Glowing Perimeter Border & Confirmation Modal */}
       <DriveBorder
         status={driveStatus}
         onConfirmAction={handleApproveDrive}
@@ -218,7 +244,7 @@ export const OverlayWindow: React.FC = () => {
         onAbortDrive={handleAbortDrive}
       />
 
-      {/* 5. Three.js 3D Interactive Spatial Object Viewer */}
+      {/* 4. Three.js 3D Interactive Spatial Object Viewer */}
       {model3D && model3D.visible && (
         <Model3DViewer model={model3D} onClose={() => setModel3D(null)} />
       )}
@@ -252,7 +278,6 @@ export const OverlayWindow: React.FC = () => {
                   x: Math.round((rx / window.innerWidth) * 1000),
                   y: Math.round((ry / window.innerHeight) * 1000),
                   label: "Target UI Element",
-                  screenIndex: 0,
                   durationMs: 420,
                 });
               }}
@@ -264,15 +289,14 @@ export const OverlayWindow: React.FC = () => {
             {/* Test Draw Box */}
             <button
               onClick={() => {
-                const cx = window.innerWidth / 2;
-                const cy = window.innerHeight / 2;
                 setDrawings((prev) => [
                   ...prev,
                   {
+                    id: `dev-box-${Date.now()}`,
                     shape: "box",
-                    coords: [cx - 140, cy - 80, cx + 140, cy + 80],
+                    coords: [350, 350, 650, 650],
                     label: "Critical Form Area",
-                    color: "#38bdf8",
+                    color: "#10b981",
                     fadeMs: 8000,
                   },
                 ]);

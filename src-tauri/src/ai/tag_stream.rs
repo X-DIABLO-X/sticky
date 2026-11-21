@@ -25,6 +25,10 @@ pub enum OverlayCommand {
         bbox: [i32; 4],
         instruction: String,
     },
+    ClearDrawings,
+    Guide {
+        active: bool,
+    },
     Raw(String),
 }
 
@@ -44,7 +48,7 @@ impl Default for TagStreamParser {
 impl TagStreamParser {
     pub fn new() -> Self {
         Self {
-            tag_buffer: String::with_capacity(256),
+            tag_buffer: String::with_capacity(512),
             is_in_tag: false,
             last_char_was_space: false,
             just_closed_tag: false,
@@ -73,7 +77,7 @@ impl TagStreamParser {
                     }
                     self.tag_buffer.clear();
                     self.is_in_tag = false;
-                } else if self.tag_buffer.len() > 128 {
+                } else if self.tag_buffer.len() > 512 {
                     // Tag too long without closing bracket, abort and flush as text
                     clean_text.push_str(&self.tag_buffer);
                     self.last_char_was_space = self.tag_buffer.ends_with(' ');
@@ -140,20 +144,72 @@ fn parse_tag(content: &str) -> Option<OverlayCommand> {
             }
         }
         "DRAW" => {
-            // [DRAW:circle:x,y,r:color] or [DRAW:box:x1,y1,x2,y2:label]
+            // [DRAW:clear]
+            // [DRAW:shape:coords]
+            // [DRAW:shape:coords:#color]
+            // [DRAW:shape:coords:label]
+            // [DRAW:shape:coords:#color:label]
+            if parts.len() >= 2 && parts[1].trim().eq_ignore_ascii_case("clear") {
+                return Some(OverlayCommand::ClearDrawings);
+            }
             if parts.len() >= 3 {
-                let shape = parts[1].trim().to_string();
+                let shape = parts[1].trim().to_lowercase();
+                match shape.as_str() {
+                    "line" | "arrow" | "curve" | "polygon" | "circle" | "box" | "text" => {}
+                    _ => return None,
+                }
                 let coords: Vec<i32> = parts[2]
                     .split(',')
                     .filter_map(|s| s.trim().parse::<i32>().ok())
                     .collect();
-                let color_or_label = parts.get(3).map(|s| s.trim().to_string());
+                if coords.is_empty() {
+                    return None;
+                }
+
+                let mut color: Option<String> = None;
+                let mut label: Option<String> = None;
+
+                if let Some(p3) = parts.get(3) {
+                    let trimmed = p3.trim();
+                    if trimmed.starts_with('#') {
+                        color = Some(trimmed.to_string());
+                        if parts.len() >= 5 {
+                            let lbl = parts[4..].join(":").trim().to_string();
+                            if !lbl.is_empty() {
+                                label = Some(lbl);
+                            }
+                        }
+                    } else if !trimmed.is_empty() {
+                        let lbl = parts[3..].join(":").trim().to_string();
+                        if !lbl.is_empty() {
+                            label = Some(lbl);
+                        }
+                    } else if parts.len() >= 5 {
+                        let lbl = parts[4..].join(":").trim().to_string();
+                        if !lbl.is_empty() {
+                            label = Some(lbl);
+                        }
+                    }
+                }
+
                 Some(OverlayCommand::Draw {
                     shape,
                     coords,
-                    color: color_or_label.clone(),
-                    label: color_or_label,
+                    color,
+                    label,
                 })
+            } else {
+                None
+            }
+        }
+        "GUIDE" => {
+            // [GUIDE:continue] or [GUIDE:done]
+            if parts.len() >= 2 {
+                match parts[1].trim().to_lowercase().as_str() {
+                    "continue" | "next" | "active" => Some(OverlayCommand::Guide { active: true }),
+                    "done" | "complete" | "stop" => Some(OverlayCommand::Guide { active: false }),
+                    _ => None,
+                }
             } else {
                 None
             }
@@ -270,13 +326,85 @@ mod tests {
         assert_eq!(clean, "Examine the canvas.");
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
-            OverlayCommand::Draw { shape, coords, color, .. } => {
+            OverlayCommand::Draw { shape, coords, color, label } => {
                 assert_eq!(shape, "circle");
                 assert_eq!(coords, &[400, 300, 80]);
                 assert_eq!(color.as_deref(), Some("#38bdf8"));
+                assert_eq!(label.as_deref(), None);
             }
             _ => panic!("Expected Draw circle command"),
         }
+    }
+
+    #[test]
+    fn test_draw_polygon_curve_line_and_clear() {
+        let mut parser = TagStreamParser::new();
+        let input = "Look at [DRAW:polygon:100,100,200,120,180,220,90,200:#10b981:Mesh] then follow [DRAW:curve:100,200,250,50,400,200:#10b981:Arc] and [DRAW:line:10,20,300,400:#f59e0b:Guide Line] then [DRAW:clear] done.";
+        let (clean, cmds) = parser.feed_token(input);
+        assert_eq!(clean, "Look at then follow and then done.");
+        assert_eq!(cmds.len(), 4);
+
+        match &cmds[0] {
+            OverlayCommand::Draw { shape, coords, color, label } => {
+                assert_eq!(shape, "polygon");
+                assert_eq!(coords, &[100, 100, 200, 120, 180, 220, 90, 200]);
+                assert_eq!(color.as_deref(), Some("#10b981"));
+                assert_eq!(label.as_deref(), Some("Mesh"));
+            }
+            _ => panic!("Expected Draw polygon command"),
+        }
+        match &cmds[1] {
+            OverlayCommand::Draw { shape, coords, color, label } => {
+                assert_eq!(shape, "curve");
+                assert_eq!(coords, &[100, 200, 250, 50, 400, 200]);
+                assert_eq!(color.as_deref(), Some("#10b981"));
+                assert_eq!(label.as_deref(), Some("Arc"));
+            }
+            _ => panic!("Expected Draw curve command"),
+        }
+        match &cmds[2] {
+            OverlayCommand::Draw { shape, coords, color, label } => {
+                assert_eq!(shape, "line");
+                assert_eq!(coords, &[10, 20, 300, 400]);
+                assert_eq!(color.as_deref(), Some("#f59e0b"));
+                assert_eq!(label.as_deref(), Some("Guide Line"));
+            }
+            _ => panic!("Expected Draw line command"),
+        }
+        assert_eq!(cmds[3], OverlayCommand::ClearDrawings);
+    }
+
+    #[test]
+    fn test_long_polygon_over_128_bytes() {
+        let mut parser = TagStreamParser::new();
+        let long_tag = "[DRAW:polygon:100,100,150,110,200,120,250,140,300,160,350,190,400,220,420,260,390,310,340,350,280,370,220,360,160,330,120,280,95,220,90,160:#10b981:Complex Outline]";
+        assert!(long_tag.len() > 128);
+        let (clean, cmds) = parser.feed_token(&format!("Trace {} here.", long_tag));
+        assert_eq!(clean, "Trace here.");
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0] {
+            OverlayCommand::Draw { shape, coords, color, label } => {
+                assert_eq!(shape, "polygon");
+                assert_eq!(coords.len(), 32);
+                assert_eq!(color.as_deref(), Some("#10b981"));
+                assert_eq!(label.as_deref(), Some("Complex Outline"));
+            }
+            _ => panic!("Expected long Draw polygon command"),
+        }
+    }
+
+    #[test]
+    fn test_guide_tags() {
+        let mut parser = TagStreamParser::new();
+        let (clean1, cmds1) = parser.feed_token("First click Add at the top. [POINT:120,45:Add] [GUIDE:continue]");
+        assert_eq!(clean1, "First click Add at the top. ");
+        assert_eq!(cmds1.len(), 2);
+        assert_eq!(cmds1[1], OverlayCommand::Guide { active: true });
+
+        let (clean2, cmds2) = parser.feed_token("Awesome, your cube is right there! [GUIDE:done]");
+        assert_eq!(clean2, "Awesome, your cube is right there! ");
+        assert_eq!(cmds2.len(), 1);
+        assert_eq!(cmds2[0], OverlayCommand::Guide { active: false });
     }
 
     #[test]
