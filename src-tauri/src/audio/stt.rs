@@ -9,6 +9,7 @@ use crate::error::{AppError, Result};
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 const EMBEDDED_LOCAL_STT_PY: &str = include_str!("../../../scripts/local_stt.py");
+const EMBEDDED_NEURAL_TTS_PY: &str = include_str!("../../../scripts/neural_tts.py");
 
 #[derive(Clone)]
 pub struct SttService {
@@ -240,15 +241,20 @@ pub fn resolve_script_path(filename: &str) -> PathBuf {
         }
     }
 
-    // Self-contained fallback: extract embedded local_stt.py so the exe works from any folder/shortcut
-    if filename == "local_stt.py" {
+    // Self-contained fallback: extract embedded scripts so the exe works from any folder/shortcut
+    let embedded = match filename {
+        "local_stt.py" => Some(EMBEDDED_LOCAL_STT_PY),
+        "neural_tts.py" => Some(EMBEDDED_NEURAL_TTS_PY),
+        _ => None,
+    };
+    if let Some(contents) = embedded {
         let target = dirs::home_dir()
-            .map(|h| h.join(".heyclicky").join("scripts").join("local_stt.py"))
-            .unwrap_or_else(|| std::env::temp_dir().join("sticky_local_stt.py"));
+            .map(|h| h.join(".heyclicky").join("scripts").join(filename))
+            .unwrap_or_else(|| std::env::temp_dir().join(format!("sticky_{filename}")));
         if let Some(parent) = target.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if std::fs::write(&target, EMBEDDED_LOCAL_STT_PY).is_ok() {
+        if std::fs::write(&target, contents).is_ok() {
             return target;
         }
     }

@@ -71,12 +71,89 @@ impl KokoroTts {
             .join(" ")
     }
 
+    /// Synthesize natural human neural voice via Edge-TTS (`scripts/neural_tts.py`) into a 24kHz WAV,
+    /// returning the WAV bytes on success.
+    async fn synthesize_neural_wav(&self, b64_text: &str) -> Result<Vec<u8>> {
+        let script_path = crate::audio::stt::resolve_script_path("neural_tts.py");
+        if !script_path.exists() {
+            return Err(AppError::Audio("neural_tts.py not found".into()));
+        }
+
+        let temp_wav = std::env::temp_dir().join(format!("sticky_ntts_{}.wav", uuid::Uuid::new_v4()));
+        let python_bin = crate::audio::stt::resolve_python_executable();
+
+        let mut cmd = tokio::process::Command::new(&python_bin);
+        cmd.arg(&script_path).arg(b64_text).arg(&temp_wav);
+
+        #[cfg(windows)]
+        cmd.creation_flags(CREATE_NO_WINDOW);
+
+        let output = cmd
+            .output()
+            .await
+            .map_err(|e| AppError::Audio(format!("Neural TTS failed to launch: {e}")))?;
+
+        if !output.status.success() || !temp_wav.exists() {
+            let _ = tokio::fs::remove_file(&temp_wav).await;
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(AppError::Audio(format!(
+                "Neural TTS failed (exit {:?}): {}",
+                output.status.code(),
+                stderr.trim()
+            )));
+        }
+
+        let wav_bytes = tokio::fs::read(&temp_wav)
+            .await
+            .map_err(|e| AppError::Audio(format!("Failed reading neural TTS WAV: {e}")))?;
+        let _ = tokio::fs::remove_file(&temp_wav).await;
+        Ok(wav_bytes)
+    }
+
+    async fn play_wav_bytes(&self, wav_bytes: Vec<u8>) -> Result<()> {
+        let mut reader = hound::WavReader::new(std::io::Cursor::new(wav_bytes))
+            .map_err(|e| AppError::Audio(format!("Invalid WAV from TTS: {e}")))?;
+        let spec = reader.spec();
+        let samples: Vec<f32> = match spec.sample_format {
+            hound::SampleFormat::Int => reader
+                .samples::<i16>()
+                .filter_map(std::result::Result::ok)
+                .map(|s| s as f32 / i16::MAX as f32)
+                .collect(),
+            hound::SampleFormat::Float => reader
+                .samples::<f32>()
+                .filter_map(std::result::Result::ok)
+                .collect(),
+        };
+
+        let guard = self.output_handle.lock().await;
+        if let Some(ref out) = *guard {
+            out.play_pcm_f32(samples, spec.sample_rate, spec.channels);
+            return Ok(());
+        }
+
+        Err(AppError::Audio(
+            "Audio output device not initialized (rodio sink is None)".into(),
+        ))
+    }
+
     pub async fn synthesize_and_play(&self, text: &str) -> Result<()> {
         let clean_text = Self::sanitize_for_speech(text);
         if clean_text.is_empty() {
             return Ok(());
         }
 
+        let b64_text = base64::engine::general_purpose::STANDARD.encode(clean_text.as_bytes());
+
+        // 1. Primary: Natural neural voice via Edge-TTS (Microsoft Ava Multilingual Neural)
+        match self.synthesize_neural_wav(&b64_text).await {
+            Ok(wav_bytes) => return self.play_wav_bytes(wav_bytes).await,
+            Err(e) => {
+                eprintln!("[TTS] Neural TTS unavailable, falling back to OS TTS: {e}");
+            }
+        }
+
+        // 2. Offline OS fallback
         #[cfg(target_os = "macos")]
         {
             let status = tokio::process::Command::new("say")
@@ -111,7 +188,6 @@ impl KokoroTts {
 
         #[cfg(target_os = "windows")]
         {
-            let b64_text = base64::engine::general_purpose::STANDARD.encode(clean_text.as_bytes());
             let script_path = crate::audio::stt::resolve_script_path("speak.ps1");
             let temp_wav = std::env::temp_dir().join(format!("sticky_tts_{}.wav", uuid::Uuid::new_v4()));
 
@@ -124,7 +200,6 @@ impl KokoroTts {
                     .args(["-TextBase64", &b64_text, "-OutFile"])
                     .arg(&temp_wav);
             } else {
-                // Self-contained inline SAPI fallback if speak.ps1 is missing
                 let wav_str = temp_wav.to_string_lossy().replace('\'', "''");
                 let ps_inline = format!(
                     "Add-Type -AssemblyName System.Speech; \
@@ -155,30 +230,7 @@ impl KokoroTts {
                 .map_err(|e| AppError::Audio(format!("Failed reading synthesized WAV: {e}")))?;
             let _ = tokio::fs::remove_file(&temp_wav).await;
 
-            let mut reader = hound::WavReader::new(std::io::Cursor::new(wav_bytes))
-                .map_err(|e| AppError::Audio(format!("Invalid WAV from TTS: {e}")))?;
-            let spec = reader.spec();
-            let samples: Vec<f32> = match spec.sample_format {
-                hound::SampleFormat::Int => reader
-                    .samples::<i16>()
-                    .filter_map(std::result::Result::ok)
-                    .map(|s| s as f32 / i16::MAX as f32)
-                    .collect(),
-                hound::SampleFormat::Float => reader
-                    .samples::<f32>()
-                    .filter_map(std::result::Result::ok)
-                    .collect(),
-            };
-
-            let guard = self.output_handle.lock().await;
-            if let Some(ref out) = *guard {
-                out.play_pcm_f32(samples, spec.sample_rate, spec.channels);
-                return Ok(());
-            }
-
-            return Err(AppError::Audio(
-                "Audio output device not initialized (rodio sink is None)".into(),
-            ));
+            self.play_wav_bytes(wav_bytes).await
         }
     }
 }
