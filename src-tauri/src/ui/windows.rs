@@ -1,86 +1,180 @@
-use tauri::{AppHandle, Manager, PhysicalPosition, Position};
+use std::time::Duration;
+use tauri::{AppHandle, Manager, PhysicalPosition, PhysicalSize};
 use crate::error::{AppError, Result};
-use crate::screen::input::get_current_cursor_pos;
 
 pub struct WindowManager;
 
 impl WindowManager {
     pub fn show(app: &AppHandle, label: &str) -> Result<()> {
-        let win = app.get_webview_window(label)
-            .ok_or_else(|| AppError::Ui(format!("Window '{}' not found", label)))?;
-        let _ = win.unminimize();
-        win.show().map_err(|e| AppError::Ui(format!("Failed to show window {}: {}", label, e)))?;
-        win.set_focus().map_err(|e| AppError::Ui(format!("Failed to focus window {}: {}", label, e)))?;
+        if let Some(win) = app.get_webview_window(label) {
+            let _ = win.unminimize();
+            win.show().map_err(|e| AppError::Config(e.to_string()))?;
+            if label == "dashboard" || label == "quick_input" {
+                let _ = win.set_focus();
+            } else {
+                Self::enforce_topmost_native(&win, label == "overlay");
+            }
+        }
         Ok(())
     }
 
     pub fn hide(app: &AppHandle, label: &str) -> Result<()> {
-        let win = app.get_webview_window(label)
-            .ok_or_else(|| AppError::Ui(format!("Window '{}' not found", label)))?;
-        win.hide().map_err(|e| AppError::Ui(format!("Failed to hide window {}: {}", label, e)))?;
+        if let Some(win) = app.get_webview_window(label) {
+            win.hide().map_err(|e| AppError::Config(e.to_string()))?;
+        }
         Ok(())
     }
 
     pub fn toggle(app: &AppHandle, label: &str) -> Result<bool> {
-        let win = app.get_webview_window(label)
-            .ok_or_else(|| AppError::Ui(format!("Window '{}' not found", label)))?;
-
-        let is_visible = win.is_visible()
-            .map_err(|e| AppError::Ui(format!("Failed to check visibility for {}: {}", label, e)))?;
-
-        if is_visible {
-            win.hide().map_err(|e| AppError::Ui(e.to_string()))?;
-            Ok(false)
-        } else {
-            win.show().map_err(|e| AppError::Ui(e.to_string()))?;
-            win.set_focus().map_err(|e| AppError::Ui(e.to_string()))?;
-            Ok(true)
+        if let Some(win) = app.get_webview_window(label) {
+            let visible = win.is_visible().unwrap_or(false);
+            if visible {
+                win.hide().map_err(|e| AppError::Config(e.to_string()))?;
+                return Ok(false);
+            } else {
+                let _ = win.unminimize();
+                win.show().map_err(|e| AppError::Config(e.to_string()))?;
+                if label == "dashboard" || label == "quick_input" {
+                    let _ = win.set_focus();
+                } else {
+                    Self::enforce_topmost_native(&win, label == "overlay");
+                }
+                return Ok(true);
+            }
         }
-    }
-
-    pub fn set_position(app: &AppHandle, label: &str, x: i32, y: i32) -> Result<()> {
-        let win = app.get_webview_window(label)
-            .ok_or_else(|| AppError::Ui(format!("Window '{}' not found", label)))?;
-
-        win.set_position(Position::Physical(PhysicalPosition { x, y }))
-            .map_err(|e| AppError::Ui(format!("Failed to position window {}: {}", label, e)))?;
-
-        Ok(())
+        Ok(false)
     }
 
     pub fn set_ignore_cursor_events(app: &AppHandle, label: &str, ignore: bool) -> Result<()> {
-        let win = app.get_webview_window(label)
-            .ok_or_else(|| AppError::Ui(format!("Window '{}' not found", label)))?;
+        if let Some(win) = app.get_webview_window(label) {
+            win.set_ignore_cursor_events(ignore)
+                .map_err(|e| AppError::Config(e.to_string()))?;
+            Self::enforce_topmost_native(&win, ignore);
+        }
+        Ok(())
+    }
 
-        win.set_ignore_cursor_events(ignore)
-            .map_err(|e| AppError::Ui(format!("Failed to set ignore_cursor_events on {}: {}", label, e)))?;
-
+    pub fn set_position(app: &AppHandle, label: &str, x: i32, y: i32) -> Result<()> {
+        if let Some(win) = app.get_webview_window(label) {
+            win.set_position(PhysicalPosition::new(x, y))
+                .map_err(|e| AppError::Ui(format!("Failed to position window {}: {}", label, e)))?;
+        }
         Ok(())
     }
 
     pub fn position_bubble_at_cursor(app: &AppHandle) -> Result<()> {
-        let (cx, cy) = get_current_cursor_pos();
-        // Place bubble 24px below-right of cursor
+        let (cx, cy) = crate::screen::input::get_current_cursor_pos();
         Self::set_position(app, "bubble", cx + 24, cy + 24)
     }
 
     pub fn position_pill_top_center(app: &AppHandle) -> Result<()> {
-        let win = app.get_webview_window("pill")
-            .ok_or_else(|| AppError::Ui("Pill window not found".into()))?;
-
-        let monitor = win.current_monitor().ok().flatten()
-            .or_else(|| app.primary_monitor().ok().flatten());
-
-        if let Some(mon) = monitor {
-            let scale_factor = mon.scale_factor();
-            let screen_width = mon.size().width as f64 / scale_factor;
-            let pill_width = 320.0;
-            let x = ((screen_width - pill_width) / 2.0 * scale_factor) as i32;
-            let y = (8.0 * scale_factor) as i32;
-            Self::set_position(app, "pill", x, y)?;
+        if let Some(win) = app.get_webview_window("pill") {
+            if let Ok(Some(monitor)) = win.primary_monitor() {
+                let size = monitor.size();
+                let pos = monitor.position();
+                let pill_w = 320i32;
+                let x = pos.x + ((size.width as i32) - pill_w) / 2;
+                let y = pos.y + 10;
+                let _ = win.set_position(PhysicalPosition::new(x, y));
+            }
+            Self::enforce_topmost_native(&win, false);
         }
-        let _ = win.show();
-        let _ = win.set_focus();
         Ok(())
+    }
+
+    /// Configures the transparent overlay to cover the full virtual desktop (all monitors)
+    /// WITHOUT using `fullscreen: true` (which breaks Windows 11 DWM Z-order & Taskbar layering).
+    pub fn configure_overlay_window(app: &AppHandle) -> Result<()> {
+        if let Some(win) = app.get_webview_window("overlay") {
+            #[cfg(windows)]
+            {
+                use windows::Win32::UI::WindowsAndMessaging::{
+                    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+                    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+                };
+                unsafe {
+                    let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+                    let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+                    let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+                    let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+                    if vw > 0 && vh > 0 {
+                        let _ = win.set_position(PhysicalPosition::new(vx, vy));
+                        let _ = win.set_size(PhysicalSize::new(vw as u32, vh as u32));
+                    }
+                }
+            }
+
+            #[cfg(not(windows))]
+            {
+                if let Ok(Some(monitor)) = win.primary_monitor() {
+                    let _ = win.set_position(*monitor.position());
+                    let _ = win.set_size(*monitor.size());
+                }
+            }
+
+            let _ = win.set_ignore_cursor_events(true);
+            let _ = win.set_visible_on_all_workspaces(true);
+            Self::enforce_topmost_native(&win, true);
+            let _ = win.show();
+        }
+        Ok(())
+    }
+
+    /// Directly applies Win32 `SetWindowPos(HWND_TOPMOST)` + `WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`
+    /// bypassing tao's stale `WS_EX_TOPMOST` style-cache bug (tauri-apps/tao#1234).
+    pub fn enforce_topmost_native(win: &tauri::WebviewWindow, click_through: bool) {
+        let _ = win.set_always_on_top(true);
+
+        #[cfg(windows)]
+        {
+            use windows::Win32::Foundation::HWND;
+            use windows::Win32::UI::WindowsAndMessaging::{
+                GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, HWND_TOPMOST,
+                SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+                WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
+            };
+
+            if let Ok(raw_hwnd) = win.hwnd() {
+                let hwnd = HWND(raw_hwnd.0);
+                unsafe {
+                    let mut ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+                    ex_style |= (WS_EX_TOPMOST.0 | WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0 | WS_EX_LAYERED.0) as isize;
+                    if click_through {
+                        ex_style |= WS_EX_TRANSPARENT.0 as isize;
+                    } else {
+                        ex_style &= !(WS_EX_TRANSPARENT.0 as isize);
+                    }
+                    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style);
+
+                    let _ = SetWindowPos(
+                        hwnd,
+                        HWND_TOPMOST,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Background Z-order keeper: re-asserts HWND_TOPMOST every 750ms without stealing focus,
+    /// ensuring overlay/pill/bubble stay above Taskbar, VS Code, Chrome, and borderless apps.
+    pub fn start_topmost_keeper(app: AppHandle) {
+        tauri::async_runtime::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(750));
+            loop {
+                interval.tick().await;
+                for (label, click_through) in [("overlay", true), ("pill", false), ("bubble", false)] {
+                    if let Some(win) = app.get_webview_window(label) {
+                        if win.is_visible().unwrap_or(false) {
+                            Self::enforce_topmost_native(&win, click_through);
+                        }
+                    }
+                }
+            }
+        });
     }
 }

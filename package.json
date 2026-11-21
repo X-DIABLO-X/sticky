@@ -9,14 +9,22 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@radix-ui/react-select": "^2.4.1",
+    "@radix-ui/react-switch": "^1.4.1",
+    "@radix-ui/react-tabs": "^1.2.1",
+    "@radix-ui/react-tooltip": "^1.4.1",
     "@react-three/fiber": "^9.8.2",
     "@tauri-apps/api": "^2.1.1",
     "@tauri-apps/plugin-global-shortcut": "^2.2.0",
+    "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
+    "cmdk": "^1.1.1",
+    "framer-motion": "^14.14.0",
     "lucide-react": "^1.72.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "roughjs": "^4.6.6",
+    "sonner": "^2.0.8",
     "tailwind-merge": "^3.0.0",
     "three": "^0.187.0"
   },

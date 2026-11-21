@@ -1,8 +1,10 @@
+use std::time::Duration;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::json;
 use tokio::sync::mpsc::{channel, Receiver};
+
 use crate::ai::providers::{ChatChunk, ChatMessage, LlmProvider, ToolCall, ToolDefinition};
 use crate::error::{AppError, Result};
 
@@ -13,28 +15,39 @@ pub struct LocalLlamaProvider {
 
 impl LocalLlamaProvider {
     pub fn new(base_url: String) -> Self {
-        Self {
-            base_url,
-            client: Client::new(),
-        }
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(90))
+            .build()
+            .unwrap_or_else(|_| Client::new());
+        Self { base_url, client }
     }
 
     pub async fn check_health(&self) -> bool {
-        let url = format!("{}/api/version", self.base_url.trim_end_matches('/'));
-        match self.client.get(&url).send().await {
-            Ok(res) => res.status().is_success(),
-            Err(_) => false,
+        let base = self.base_url.trim_end_matches('/');
+        for path in ["/api/version", "/health", "/v1/models"] {
+            if let Ok(res) = self.client.get(format!("{base}{path}")).send().await {
+                if res.status().is_success() {
+                    return true;
+                }
+            }
         }
+        false
     }
 
     pub async fn list_models(&self) -> Result<Vec<String>> {
         let url = format!("{}/api/tags", self.base_url.trim_end_matches('/'));
-        let res = self.client.get(&url).send().await
+        let res = self
+            .client
+            .get(&url)
+            .send()
+            .await
             .map_err(|e| AppError::Ai(format!("Failed to connect to Ollama at {}: {}", self.base_url, e)))?;
 
         if let Ok(json) = res.json::<serde_json::Value>().await {
             if let Some(models) = json.get("models").and_then(|m| m.as_array()) {
-                let list = models.iter()
+                let list = models
+                    .iter()
                     .filter_map(|m| m.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
                     .collect();
                 return Ok(list);
@@ -42,30 +55,25 @@ impl LocalLlamaProvider {
         }
         Ok(vec![])
     }
-}
 
-#[async_trait]
-impl LlmProvider for LocalLlamaProvider {
-    fn provider_name(&self) -> &str {
-        "local_llamacpp"
-    }
-
-    async fn stream_chat(
-        &self,
+    fn build_ollama_payload(
         model: &str,
         messages: &[ChatMessage],
         tools: &[ToolDefinition],
-    ) -> Result<Receiver<Result<ChatChunk>>> {
-        let url = format!("{}/api/chat", self.base_url.trim_end_matches('/'));
-
+        include_images: bool,
+    ) -> serde_json::Value {
         let formatted_messages: Vec<serde_json::Value> = messages
             .iter()
             .map(|m| {
                 let mut map = serde_json::Map::new();
                 map.insert("role".to_string(), json!(m.role));
                 map.insert("content".to_string(), json!(m.content));
-                if let Some(ref imgs) = m.images_base64 {
-                    map.insert("images".to_string(), json!(imgs));
+                if include_images {
+                    if let Some(ref imgs) = m.images_base64 {
+                        if !imgs.is_empty() {
+                            map.insert("images".to_string(), json!(imgs));
+                        }
+                    }
                 }
                 serde_json::Value::Object(map)
             })
@@ -75,7 +83,6 @@ impl LlmProvider for LocalLlamaProvider {
             "model": model,
             "messages": formatted_messages,
             "stream": true,
-            "think": false,
             "options": {
                 "temperature": 0.2
             }
@@ -98,17 +105,49 @@ impl LlmProvider for LocalLlamaProvider {
             payload["tools"] = json!(tools_json);
         }
 
-        let response = self.client
+        payload
+    }
+}
+
+#[async_trait]
+impl LlmProvider for LocalLlamaProvider {
+    fn provider_name(&self) -> &str {
+        "local_llamacpp"
+    }
+
+    async fn stream_chat(
+        &self,
+        model: &str,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+    ) -> Result<Receiver<Result<ChatChunk>>> {
+        let url = format!("{}/api/chat", self.base_url.trim_end_matches('/'));
+        let payload = Self::build_ollama_payload(model, messages, tools, true);
+
+        let mut response = self
+            .client
             .post(&url)
             .json(&payload)
             .send()
             .await
-            .map_err(|e| AppError::Ai(format!("Local llama request error: {}", e)))?;
+            .map_err(|e| AppError::Ai(format!("Local Ollama request error: {e}")))?;
+
+        // If a text-only local model rejects `images` with HTTP 400, automatically retry without images
+        if response.status().as_u16() == 400 {
+            let retry_payload = Self::build_ollama_payload(model, messages, tools, false);
+            response = self
+                .client
+                .post(&url)
+                .json(&retry_payload)
+                .send()
+                .await
+                .map_err(|e| AppError::Ai(format!("Local Ollama text-only retry error: {e}")))?;
+        }
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(AppError::Ai(format!("Local llama HTTP {} error: {}", status, body)));
+            return Err(AppError::Ai(format!("Local Ollama HTTP {status}: {body}")));
         }
 
         let (tx, rx) = channel(100);
@@ -120,13 +159,10 @@ impl LlmProvider for LocalLlamaProvider {
             while let Some(chunk_res) = byte_stream.next().await {
                 match chunk_res {
                     Ok(bytes) => {
-                        let text = String::from_utf8_lossy(&bytes);
-                        buffer.push_str(&text);
-
+                        buffer.push_str(&String::from_utf8_lossy(&bytes));
                         while let Some(idx) = buffer.find('\n') {
                             let line = buffer[..idx].trim().to_string();
                             buffer = buffer[idx + 1..].to_string();
-
                             if line.is_empty() {
                                 continue;
                             }
@@ -158,27 +194,31 @@ impl LlmProvider for LocalLlamaProvider {
 
                                     let delta_text = content.filter(|s| !s.is_empty()).map(|s| s.to_string());
                                     if delta_text.is_some() || tool_calls.is_some() {
-                                        let _ = tx.send(Ok(ChatChunk {
-                                            delta_text,
-                                            tool_calls,
-                                            finish_reason: None,
-                                        })).await;
+                                        let _ = tx
+                                            .send(Ok(ChatChunk {
+                                                delta_text,
+                                                tool_calls,
+                                                finish_reason: None,
+                                            }))
+                                            .await;
                                     }
                                 }
 
                                 if parsed.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
-                                    let _ = tx.send(Ok(ChatChunk {
-                                        delta_text: None,
-                                        tool_calls: None,
-                                        finish_reason: Some("stop".to_string()),
-                                    })).await;
+                                    let _ = tx
+                                        .send(Ok(ChatChunk {
+                                            delta_text: None,
+                                            tool_calls: None,
+                                            finish_reason: Some("stop".to_string()),
+                                        }))
+                                        .await;
                                     return;
                                 }
                             }
                         }
                     }
                     Err(e) => {
-                        let _ = tx.send(Err(AppError::Ai(format!("Stream error: {}", e)))).await;
+                        let _ = tx.send(Err(AppError::Ai(format!("Local stream error: {e}")))).await;
                         return;
                     }
                 }

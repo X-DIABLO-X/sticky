@@ -10,9 +10,9 @@ pub mod tools;
 pub mod ui;
 
 use std::sync::Arc;
-use tauri::Manager;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
+use tauri::Manager;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::ai::router::ModelRouter;
@@ -54,39 +54,29 @@ pub struct AppState {
 static IS_QUITTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn run() {
-    // ── Single-instance guard ──────────────────────────────────────────────
-    // WebView2 locks its user-data directory; if another HeyClicky is already
-    // running, creating a second WebView will panic with HRESULT 0x800700AA
-    // ("The requested resource is in use."). We detect this early via a named
-    // mutex and exit gracefully instead of crashing.
     #[cfg(windows)]
     {
-        use windows::Win32::Foundation::HANDLE;
-        use windows::Win32::System::Threading::CreateMutexW;
         use windows::core::w;
+        use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
+        use windows::Win32::System::Threading::CreateMutexW;
 
-        let _mutex: HANDLE = unsafe {
+        let mutex: HANDLE = unsafe {
             CreateMutexW(None, false, w!("Global\\HeyClicky_SingleInstance_Guard"))
                 .unwrap_or_default()
         };
 
-        if _mutex.is_invalid() || unsafe { windows::Win32::Foundation::GetLastError() } == windows::Win32::Foundation::ERROR_ALREADY_EXISTS {
-            let log_fn = || {
-                let p = dirs::home_dir().unwrap_or_default().join(".heyclicky").join("app.log");
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
-                    use std::io::Write;
-                    let _ = writeln!(f, "[{}] Another HeyClicky instance is already running. Exiting gracefully.", chrono::Local::now());
-                }
-            };
-            log_fn();
-            eprintln!("[HeyClicky] Another instance is already running. Exiting.");
+        if mutex.is_invalid() || unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            let p = dirs::home_dir().unwrap_or_default().join(".heyclicky").join("app.log");
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+                use std::io::Write;
+                let _ = writeln!(f, "[{}] Another Sticky instance is already running. Exiting gracefully.", chrono::Local::now());
+            }
+            eprintln!("[Sticky] Another instance is already running. Exiting.");
             return;
         }
 
-        // Keep the mutex handle alive for the process lifetime by storing it in a
-        // static. Windows auto-releases the named mutex when the process exits.
         static INSTANCE_MUTEX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        INSTANCE_MUTEX.get_or_init(|| _mutex.0 as usize);
+        INSTANCE_MUTEX.get_or_init(|| mutex.0 as usize);
     }
 
     if let Some(h) = dirs::home_dir() {
@@ -95,7 +85,7 @@ pub fn run() {
         let log_path = dir.join("app.log");
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
             use std::io::Write;
-            let _ = writeln!(f, "\n[{}] Starting HeyClicky...", chrono::Local::now());
+            let _ = writeln!(f, "\n[{}] Starting Sticky...", chrono::Local::now());
         }
     }
 
@@ -126,46 +116,38 @@ pub fn run() {
     let build_result = tauri::Builder::default()
         .plugin(shortcut_builder)
         .setup(|app| {
-            let log = |m: &str| {
-                let p = dirs::home_dir().unwrap_or_default().join(".heyclicky").join("app.log");
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
-                    use std::io::Write;
-                    let _ = writeln!(f, "[{}] {}", chrono::Local::now(), m);
-                }
-            };
-
-            log("Setup: loading config");
             let handle = app.handle().clone();
-            let config = AppConfig::load().unwrap_or_default();
 
-            // Initialize SQLite
-            log("Setup: opening SQLite database");
+            // macOS: allow overlay/pill to float above full-screen Spaces (tauri-apps/tauri#11488)
+            #[cfg(target_os = "macos")]
+            {
+                let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            }
+
+            let config = AppConfig::load().unwrap_or_default();
+            let config_lock = Arc::new(RwLock::new(config.clone()));
+
             let db = Database::open(&config.db_path)
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
-
             let memory_repo = Arc::new(MemoryRepository::new(db.clone()));
             let agents_repo = Arc::new(AgentsRepository::new(db.clone()));
 
-            // Initialize Audio Engine
-            log("Setup: initializing audio engine");
+            // Initialize Audio Engine + Rodio output thread
             let mut audio_engine = AudioEngine::new(config.groq_api_key.clone());
-            // init_output spawns a dedicated thread for rodio, safe to block_on here during setup
-            let _ = tauri::async_runtime::block_on(audio_engine.init_output());
+            if let Err(e) = tauri::async_runtime::block_on(audio_engine.init_output()) {
+                eprintln!("[Sticky] Audio output init warning: {e}");
+            }
             let audio_engine_arc = Arc::new(Mutex::new(audio_engine));
 
-            // Initialize Prewarmer
-            log("Setup: starting prewarmer");
             let prewarmer = ContextPrewarmer::new();
             prewarmer.start();
 
-            // Initialize 60Hz OS Cursor Tracker for companion overlay
-            log("Setup: starting cursor tracker");
             let cursor_tracker = crate::screen::cursor::CursorTracker::new();
             cursor_tracker.start(handle.clone());
 
-            // Initialize AI Router & Tools
-            log("Setup: initializing router and tools");
-            let router = Arc::new(ModelRouter::new(config.clone()));
+            // ModelRouter shares the LIVE Arc<RwLock<AppConfig>> so saved API keys work immediately
+            let router = Arc::new(ModelRouter::new(Arc::clone(&config_lock)));
+
             let mut tool_registry = ToolRegistry::new();
             register_os_tools(&mut tool_registry);
             register_overlay_tools(&mut tool_registry, handle.clone());
@@ -179,10 +161,9 @@ pub fn run() {
                 let _ = mcp_client.load_and_register_tools(&mut guard).await;
             });
 
-            // Initialize Feature Controllers
-            log("Setup: initializing feature controllers");
             let talk_controller = Arc::new(TalkController::new(
                 handle.clone(),
+                Arc::clone(&config_lock),
                 Arc::clone(&audio_engine_arc),
                 prewarmer.clone(),
                 Arc::clone(&router),
@@ -203,60 +184,45 @@ pub fn run() {
                 let _ = sched_clone.start().await;
             });
 
-            // Set up System Tray
-            log("Setup: setting up system tray");
-            let toggle_dash = MenuItem::with_id(&handle, "toggle_dashboard", "Open Dashboard Window", true, None::<&str>)?;
+            // System tray
+            let toggle_dash = MenuItem::with_id(&handle, "toggle_dashboard", "Open Dashboard", true, None::<&str>)?;
             let toggle_item = MenuItem::with_id(&handle, "toggle_pill", "Show / Hide Pill", true, None::<&str>)?;
-            let quit_item = MenuItem::with_id(&handle, "quit", "Quit HeyClicky", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(&handle, "quit", "Quit Sticky", true, None::<&str>)?;
             let tray_menu = Menu::with_items(&handle, &[&toggle_dash, &toggle_item, &quit_item])?;
 
             let mut tray_builder = TrayIconBuilder::new()
                 .menu(&tray_menu)
                 .show_menu_on_left_click(true)
-                .on_menu_event(|app, event| {
-                    match event.id.as_ref() {
-                        "quit" => {
-                            IS_QUITTING.store(true, std::sync::atomic::Ordering::SeqCst);
-                            app.exit(0);
-                        }
-                        "toggle_dashboard" => {
-                            let _ = WindowManager::toggle(app, "dashboard");
-                        }
-                        "toggle_pill" => {
-                            let _ = WindowManager::toggle(app, "pill");
-                        }
-                        _ => {}
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "quit" => {
+                        IS_QUITTING.store(true, std::sync::atomic::Ordering::SeqCst);
+                        app.exit(0);
                     }
+                    "toggle_dashboard" => {
+                        let _ = WindowManager::toggle(app, "dashboard");
+                    }
+                    "toggle_pill" => {
+                        let _ = WindowManager::toggle(app, "pill");
+                    }
+                    _ => {}
                 });
 
             if let Some(icon) = handle.default_window_icon().cloned() {
                 tray_builder = tray_builder.icon(icon);
             }
-
             let _ = tray_builder.build(&handle);
 
-            // Setup Global Hotkeys
-            log("Setup: configuring hotkeys");
             let _ = HotkeyManager::setup_hotkeys(&handle, &config.hotkeys);
 
-            // Overlay window defaults to click-through and displayed
-            log("Setup: displaying overlay window");
-            let _ = WindowManager::set_ignore_cursor_events(&handle, "overlay", true);
-            let _ = WindowManager::show(&handle, "overlay");
-
-            // Position Pill window top center and display
-            log("Setup: positioning and displaying pill window");
+            // Configure overlay across virtual desktop + start Win32 HWND_TOPMOST keeper
+            let _ = WindowManager::configure_overlay_window(&handle);
             let _ = WindowManager::position_pill_top_center(&handle);
             let _ = WindowManager::show(&handle, "pill");
-
-            // Ensure Dashboard Window is displayed on startup front and center
-            log("Setup: displaying dashboard window");
             let _ = WindowManager::show(&handle, "dashboard");
+            WindowManager::start_topmost_keeper(handle.clone());
 
-            // Store AppState
-            log("Setup: registering AppState");
             app.manage(AppState {
-                config: Arc::new(RwLock::new(config)),
+                config: config_lock,
                 db,
                 memory_repo,
                 agents_repo,
@@ -271,7 +237,6 @@ pub fn run() {
                 scheduler_service,
             });
 
-            log("Setup: complete!");
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -325,61 +290,35 @@ pub fn run() {
 
     match build_result {
         Ok(app) => {
-            app.run(|app_handle, event| {
-                match event {
-                    tauri::RunEvent::ExitRequested { api, .. } => {
-                        if IS_QUITTING.load(std::sync::atomic::Ordering::SeqCst) {
-                            let p = dirs::home_dir().unwrap_or_default().join(".heyclicky").join("app.log");
-                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
-                                use std::io::Write;
-                                let _ = writeln!(f, "[{}] Quit confirmed. Releasing resources and shutting down.", chrono::Local::now());
-                            }
-                        } else {
-                            let p = dirs::home_dir().unwrap_or_default().join(".heyclicky").join("app.log");
-                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
-                                use std::io::Write;
-                                let _ = writeln!(f, "[{}] ExitRequested event received! Preventing exit to keep background pill & overlay running.", chrono::Local::now());
-                            }
-                            api.prevent_exit();
-                        }
+            app.run(|app_handle, event| match event {
+                tauri::RunEvent::ExitRequested { api, .. } => {
+                    if !IS_QUITTING.load(std::sync::atomic::Ordering::SeqCst) {
+                        api.prevent_exit();
                     }
-                    tauri::RunEvent::WindowEvent { label, event, .. } => {
-                        match event {
-                            tauri::WindowEvent::CloseRequested { api, .. } => {
-                                let p = dirs::home_dir().unwrap_or_default().join(".heyclicky").join("app.log");
-                                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
-                                    use std::io::Write;
-                                    let _ = writeln!(f, "[{}] CloseRequested for '{}' - hiding window instead of destroying", chrono::Local::now(), label);
-                                }
-                                api.prevent_close();
-                                if let Some(win) = app_handle.get_webview_window(&label) {
-                                    let _ = win.hide();
-                                }
-                            }
-                            tauri::WindowEvent::Destroyed => {
-                                let p = dirs::home_dir().unwrap_or_default().join(".heyclicky").join("app.log");
-                                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
-                                    use std::io::Write;
-                                    let _ = writeln!(f, "[{}] Window '{}' was destroyed!", chrono::Local::now(), label);
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    _ => {}
                 }
+                tauri::RunEvent::WindowEvent { label, event, .. } => {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        if let Some(win) = app_handle.get_webview_window(&label) {
+                            let _ = win.hide();
+                        }
+                    }
+                }
+                _ => {}
             });
         }
         Err(e) => {
-            let crash_msg = format!("[{}] FATAL: Failed to build Tauri application: {}\n", chrono::Local::now(), e);
-            let crash_path = dirs::home_dir().unwrap_or_default().join(".heyclicky").join("crash.log");
+            let crash_msg = format!(
+                "[{}] FATAL: Failed to build Tauri application: {}\n",
+                chrono::Local::now(),
+                e
+            );
+            let crash_path = dirs::home_dir()
+                .unwrap_or_default()
+                .join(".heyclicky")
+                .join("crash.log");
             let _ = std::fs::write(&crash_path, &crash_msg);
-            let log_path = dirs::home_dir().unwrap_or_default().join(".heyclicky").join("app.log");
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log_path) {
-                use std::io::Write;
-                let _ = write!(f, "{}", crash_msg);
-            }
-            eprintln!("{}", crash_msg);
+            eprintln!("{crash_msg}");
         }
     }
 }

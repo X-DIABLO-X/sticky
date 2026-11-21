@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "heyclicky-core",
+  "productName": "Sticky",
   "version": "0.1.0",
   "identifier": "com.heyclicky.clone",
   "build": {
@@ -10,14 +10,15 @@
     "frontendDist": "../dist"
   },
   "app": {
+    "macOSPrivateApi": true,
     "windows": [
       {
         "label": "dashboard",
-        "title": "HeyClicky Desktop AI - Control Center",
+        "title": "Sticky — Desktop AI Control Center",
         "url": "index.html?window=dashboard",
-        "width": 1120,
+        "width": 1140,
         "height": 760,
-        "minWidth": 860,
+        "minWidth": 880,
         "minHeight": 600,
         "resizable": true,
         "transparent": false,
@@ -29,53 +30,66 @@
       },
       {
         "label": "pill",
-        "title": "HeyClicky Pill",
+        "title": "Sticky Pill",
         "url": "index.html?window=pill",
         "width": 320,
-        "height": 56,
-        "resizable": true,
+        "height": 52,
+        "resizable": false,
         "transparent": true,
         "decorations": false,
         "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "focus": false,
         "shadow": false,
-        "visible": true
+        "visible": true,
+        "visibleOnAllWorkspaces": true
       },
       {
         "label": "bubble",
-        "title": "HeyClicky Bubble",
+        "title": "Sticky Bubble",
         "url": "index.html?window=bubble",
-        "width": 260,
-        "height": 64,
+        "width": 280,
+        "height": 68,
         "resizable": false,
         "transparent": true,
         "decorations": false,
         "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "focus": false,
         "shadow": false,
-        "visible": false
+        "visible": false,
+        "visibleOnAllWorkspaces": true
       },
       {
         "label": "overlay",
-        "title": "HeyClicky Overlay",
+        "title": "Sticky Overlay",
         "url": "index.html?window=overlay",
-        "fullscreen": true,
-        "transparent": true,
-        "decorations": false,
-        "alwaysOnTop": true,
-        "shadow": false,
-        "visible": true
-      },
-      {
-        "label": "quick_input",
-        "title": "HeyClicky Quick Input",
-        "url": "index.html?window=quick_input",
-        "width": 600,
-        "height": 72,
+        "fullscreen": false,
         "resizable": false,
         "transparent": true,
         "decorations": false,
         "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "focus": false,
         "shadow": false,
-        "visible": false
+        "visible": false,
+        "visibleOnAllWorkspaces": true
+      },
+      {
+        "label": "quick_input",
+        "title": "Sticky Command Palette",
+        "url": "index.html?window=quick_input",
+        "width": 640,
+        "height": 340,
+        "resizable": false,
+        "transparent": true,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "shadow": false,
+        "visible": false,
+        "center": true,
+        "visibleOnAllWorkspaces": true
       }
     ],
     "security": {
