@@ -37,9 +37,24 @@ pub struct TalkController {
     op_lock: Arc<Mutex<()>>,
 }
 
+fn emit_activity_log(app: &AppHandle, category: &str, title: &str, message: &str) {
+    let now = chrono::Local::now().format("%H:%M:%S%.3f").to_string();
+    let _ = app.emit(
+        "activity:log",
+        serde_json::json!({
+            "id": uuid::Uuid::new_v4().to_string(),
+            "timestamp": now,
+            "category": category,
+            "title": title,
+            "content": message
+        }),
+    );
+}
+
 fn emit_pipeline_error(app: &AppHandle, stage: &str, message: impl Into<String>) {
     let msg = message.into();
     eprintln!("[Pipeline Error][{stage}]: {msg}");
+    emit_activity_log(app, "error", &format!("{} Error", stage.to_uppercase()), &msg);
     let _ = app.emit(
         "pipeline:error",
         serde_json::json!({
@@ -150,6 +165,12 @@ impl TalkController {
             self.cancel_flag.store(false, Ordering::SeqCst);
             *state = TalkState::Listening;
             Self::emit_talk_state(&self.app_handle, TalkState::Listening);
+            emit_activity_log(
+                &self.app_handle,
+                "talk",
+                "Microphone Active",
+                "Listening for voice input via default microphone...",
+            );
             let _ = self.app_handle.emit("cursor:ptt_start", ());
             let _ = self.app_handle.emit("hotkey:talk_down", ());
             let _ = self.app_handle.emit(
@@ -218,6 +239,13 @@ impl TalkController {
                 let max_hit = elapsed >= Duration::from_millis(30000);
 
                 if trailing_hit || initial_hit || max_hit {
+                    if trailing_hit {
+                        emit_activity_log(&app_handle_clone, "talk", "Speech Ended", "Silence detected after speech; transcribing audio...");
+                    } else if initial_hit {
+                        emit_activity_log(&app_handle_clone, "talk", "Silence Timeout", "No speech detected within 6 seconds.");
+                    } else if max_hit {
+                        emit_activity_log(&app_handle_clone, "talk", "Max Duration (30s)", "Audio buffer reached 30 second limit.");
+                    }
                     if let Some(app_state) = app_handle_clone.try_state::<AppState>() {
                         let _ = app_state.talk_controller.stop_talk().await;
                     }
@@ -239,6 +267,7 @@ impl TalkController {
             }
             *state = TalkState::Transcribing;
             Self::emit_talk_state(&self.app_handle, TalkState::Transcribing);
+            emit_activity_log(&self.app_handle, "talk", "Transcribing Audio", "Audio captured; running speech-to-text...");
             let _ = self.app_handle.emit("cursor:ptt_stop", ());
             let _ = self.app_handle.emit("hotkey:talk_up", ());
             let _ = self.app_handle.emit(
@@ -264,6 +293,7 @@ impl TalkController {
         };
 
         if transcript.is_empty() {
+            emit_activity_log(&self.app_handle, "stt", "Empty Transcription", "No audible speech recognized in audio buffer.");
             let mut state = self.current_state.lock().await;
             *state = TalkState::Idle;
             Self::emit_talk_state(&self.app_handle, TalkState::Idle);
@@ -271,6 +301,7 @@ impl TalkController {
             return Ok(());
         }
 
+        emit_activity_log(&self.app_handle, "stt", "User Speech Transcribed", &transcript);
         let _ = self.app_handle.emit("talk:transcript", &transcript);
         let _ = self.app_handle.emit("talk_text", &transcript);
 
@@ -278,6 +309,7 @@ impl TalkController {
             let mut state = self.current_state.lock().await;
             *state = TalkState::Thinking;
             Self::emit_talk_state(&self.app_handle, TalkState::Thinking);
+            emit_activity_log(&self.app_handle, "llm", "Prompting AI Model", "Routing transcript with active screen & UI context...");
         }
 
         let (a11y, screen) = self.prewarmer.get_cached_context().await;
@@ -372,9 +404,15 @@ impl TalkController {
             }
         }
 
+        if !full_reply.is_empty() {
+            emit_activity_log(&self.app_handle, "llm", "LLM Output Generated", &full_reply);
+            emit_activity_log(&self.app_handle, "tts", "Voice Playback Complete", "TTS audio synthesis finished.");
+        }
+
         let mut state = self.current_state.lock().await;
         *state = TalkState::Idle;
         Self::emit_talk_state(&self.app_handle, TalkState::Idle);
+        emit_activity_log(&self.app_handle, "talk", "Ready (Idle)", "Voice pipeline returned to standby.");
         Ok(())
     }
 

@@ -30,6 +30,7 @@ import { CronManager } from "../components/agents/CronManager";
 import { ModelSettings } from "../components/settings/ModelSettings";
 import { HotkeySettings } from "../components/settings/HotkeySettings";
 import { McpSettings } from "../components/settings/McpSettings";
+import { LiveLogs } from "../components/dashboard/LiveLogs";
 import type {
   AppConfig,
   HardwareProfile as DomainHardwareProfile,
@@ -338,6 +339,7 @@ export const DashboardWindow: React.FC = () => {
             <TabsList className="flex flex-col space-y-1">
               {[
                 { id: "overview", label: "Overview", icon: <Activity className="w-4 h-4" /> },
+                { id: "logs", label: "Live Logs", icon: <Terminal className="w-4 h-4" /> },
                 { id: "agents", label: "Agents", icon: <Bot className="w-4 h-4" /> },
                 { id: "memory", label: "Memory", icon: <Database className="w-4 h-4" /> },
                 { id: "cron", label: "Schedules", icon: <Clock className="w-4 h-4" /> },
@@ -456,6 +458,10 @@ export const DashboardWindow: React.FC = () => {
                   </div>
                 )}
               </Card>
+            </TabsContent>
+
+            <TabsContent value="logs" className="outline-none">
+              <LiveLogs />
             </TabsContent>
 
             <TabsContent value="agents" className="outline-none">
