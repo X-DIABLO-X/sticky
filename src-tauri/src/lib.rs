@@ -134,6 +134,7 @@ pub fn run() {
 
             // Initialize Audio Engine + Rodio output thread
             let mut audio_engine = AudioEngine::new(config.groq_api_key.clone());
+            audio_engine.set_app_handle(handle.clone());
             audio_engine.set_input_device(config.input_device_name.clone());
             audio_engine.configure_output_device(config.output_device_name.clone());
             if let Err(e) = tauri::async_runtime::block_on(audio_engine.init_output()) {

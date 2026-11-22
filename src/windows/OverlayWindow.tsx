@@ -6,6 +6,7 @@ import type {
   Overlay3DEvent,
   OverlayVizEvent,
   OverlayVizLoadingEvent,
+  OverlayVizCueEvent,
   VizKind,
   WalkthroughStep,
   DriveStatusEvent,
@@ -24,6 +25,7 @@ import {
   Navigation,
   Box,
   Pencil,
+  Play,
   Activity,
   GitBranch,
   BarChart3,
@@ -39,6 +41,7 @@ export const OverlayWindow: React.FC = () => {
   const [model3D, setModel3D] = useState<Overlay3DEvent | null>(null);
   const [vizEvent, setVizEvent] = useState<OverlayVizEvent | null>(null);
   const [vizLoading, setVizLoading] = useState<OverlayVizLoadingEvent | null>(null);
+  const [vizCue, setVizCue] = useState<OverlayVizCueEvent | null>(null);
   const [walkthroughStep, setWalkthroughStep] = useState<WalkthroughStep | null>(null);
   const [walkthroughIndex, setWalkthroughIndex] = useState(0);
   const [walkthroughTotal, setWalkthroughTotal] = useState(0);
@@ -63,6 +66,7 @@ export const OverlayWindow: React.FC = () => {
   const devControlsRef = useRef<HTMLDivElement | null>(null);
   const model3DHostRef = useRef<HTMLDivElement | null>(null);
   const demoSketchTimerRef = useRef<number | null>(null);
+  const cueSeqRef = useRef<number>(0);
 
   const evaluateHitTest = useCallback((mx: number, my: number) => {
     let insideAny = isShiftDownRef.current;
@@ -127,6 +131,7 @@ export const OverlayWindow: React.FC = () => {
   const handleCloseViz = useCallback(() => {
     setVizEvent(null);
     setVizLoading(null);
+    setVizCue(null);
   }, []);
 
   const handleClearAll = useCallback(() => {
@@ -139,6 +144,7 @@ export const OverlayWindow: React.FC = () => {
     setClearDrawingsSignal((n) => n + 1);
     setVizEvent(null);
     setVizLoading(null);
+    setVizCue(null);
     setModel3D(null);
     setWalkthroughStep(null);
   }, []);
@@ -176,6 +182,7 @@ export const OverlayWindow: React.FC = () => {
     const found = VIZ_PRESETS[preset];
     if (found) {
       setVizLoading(null);
+      setVizCue(null);
       setVizEvent({
         ...found,
         id: `${found.id}-${Date.now()}`,
@@ -365,6 +372,7 @@ export const OverlayWindow: React.FC = () => {
       } else if (cmd.type === "VizLoading") {
         const p = cmd.payload || {};
         setVizEvent(null);
+        setVizCue(null);
         setVizLoading({
           kind: p.kind || "html",
           title: p.title || "Interactive Visualization",
@@ -372,6 +380,7 @@ export const OverlayWindow: React.FC = () => {
       } else if (cmd.type === "VizRender" && cmd.payload) {
         const p = cmd.payload;
         setVizLoading(null);
+        setVizCue(null);
         setVizEvent({
           id: p.id || `viz_${Date.now()}`,
           kind: (p.kind || "html") as VizKind,
@@ -380,11 +389,45 @@ export const OverlayWindow: React.FC = () => {
           width: typeof p.width === "number" ? p.width : undefined,
           height: typeof p.height === "number" ? p.height : undefined,
         });
+      } else if (cmd.type === "VizCue" && cmd.payload) {
+        const idx =
+          typeof cmd.payload.index === "number"
+            ? cmd.payload.index
+            : Number(cmd.payload.index);
+        if (Number.isFinite(idx)) {
+          setVizCue({
+            index: idx,
+            caption:
+              typeof cmd.payload.caption === "string"
+                ? cmd.payload.caption
+                : undefined,
+            seq: ++cueSeqRef.current,
+          });
+        }
       } else if (cmd.type === "VizClose") {
         setVizEvent(null);
         setVizLoading(null);
+        setVizCue(null);
       }
     });
+
+    const unlistenVizCue = listenEvent<{ index: number; caption?: string }>(
+      "overlay:viz_cue",
+      (payload) => {
+        if (!payload) return;
+        const idx =
+          typeof payload.index === "number"
+            ? payload.index
+            : Number(payload.index);
+        if (!Number.isFinite(idx)) return;
+        setVizCue({
+          index: idx,
+          caption:
+            typeof payload.caption === "string" ? payload.caption : undefined,
+          seq: ++cueSeqRef.current,
+        });
+      }
+    );
 
     const unlistenDemo = listenEvent<string | { preset?: string }>(
       "overlay:demo",
@@ -437,6 +480,7 @@ export const OverlayWindow: React.FC = () => {
 
     return () => {
       unlistenCmd.then((u) => u());
+      unlistenVizCue.then((u) => u());
       unlistenDemo.then((u) => u());
       unlistenPointClear.then((u) => u());
       unlistenClearDrawings.then((u) => u());
@@ -508,10 +552,11 @@ export const OverlayWindow: React.FC = () => {
         onRegisterToolbarRect={handleDrawingToolbarRect}
       />
 
-      {/* 2. HeyClicky-Grade Live Code Visualization Stage (HTML / Three.js / Mermaid / SVG / Chart) */}
+      {/* 2. HeyClicky-Grade Live Code Visualization Stage (HTML / Three.js / Mermaid / SVG / Chart / Manim Anim) */}
       <VisualizationStage
         viz={vizEvent}
         loading={vizLoading}
+        activeCue={vizCue}
         onClose={handleCloseViz}
         onRectChange={handleVizRectChange}
       />
@@ -573,6 +618,14 @@ export const OverlayWindow: React.FC = () => {
               className="flex items-center gap-1 px-2 py-1 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-400/35 transition-colors"
             >
               <Pencil className="w-3 h-3" /> Sketch
+            </button>
+
+            {/* Manim 3Blue1Brown Animation */}
+            <button
+              onClick={() => triggerDemoPreset("manim_gradient_descent")}
+              className="flex items-center gap-1 px-2 py-1 rounded-lg bg-gradient-to-r from-emerald-500/20 to-indigo-500/25 hover:from-emerald-500/30 hover:to-indigo-500/35 text-emerald-200 border border-emerald-400/45 shadow-[0_0_10px_rgba(16,185,129,0.2)] transition-all"
+            >
+              <Play className="w-3 h-3 text-emerald-300" /> Manim
             </button>
 
             {/* Spring Physics Viz */}

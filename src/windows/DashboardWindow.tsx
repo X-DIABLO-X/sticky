@@ -559,13 +559,19 @@ export const DashboardWindow: React.FC = () => {
                   </Button>
                 </div>
 
-                <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2">
+                <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-2">
                   {[
                     {
-                      id: "sketch_diagram",
-                      label: "Rough.js Sketch",
-                      sub: "Persistent whiteboard",
-                      icon: <PenTool className="w-3.5 h-3.5 text-emerald-400" />,
+                      id: "manim_gradient_descent",
+                      label: "Manim: Gradient Descent",
+                      sub: "GSAP + KaTeX 60fps",
+                      icon: <Sparkles className="w-3.5 h-3.5 text-emerald-400" />,
+                    },
+                    {
+                      id: "manim_neural_net",
+                      label: "Manim: Neural Forward",
+                      sub: "Packets + Activations",
+                      icon: <Activity className="w-3.5 h-3.5 text-indigo-400" />,
                     },
                     {
                       id: "spring_vs_easing",
@@ -578,6 +584,12 @@ export const DashboardWindow: React.FC = () => {
                       label: "3D Three.js Scene",
                       sub: "Orbit + Wireframe",
                       icon: <Box className="w-3.5 h-3.5 text-violet-400" />,
+                    },
+                    {
+                      id: "sketch_diagram",
+                      label: "Rough.js Sketch",
+                      sub: "Persistent whiteboard",
+                      icon: <PenTool className="w-3.5 h-3.5 text-teal-400" />,
                     },
                     {
                       id: "mermaid_flow",

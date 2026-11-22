@@ -33,7 +33,7 @@ export interface OverlayDrawEvent {
   style?: "sketch" | "clean";
 }
 
-export type VizKind = "html" | "canvas" | "svg" | "mermaid" | "three" | "chart";
+export type VizKind = "anim" | "html" | "canvas" | "svg" | "mermaid" | "three" | "chart";
 
 export interface OverlayVizEvent {
   id: string;
@@ -42,6 +42,12 @@ export interface OverlayVizEvent {
   code: string;
   width?: number;
   height?: number;
+}
+
+export interface OverlayVizCueEvent {
+  index: number;
+  caption?: string;
+  seq: number;
 }
 
 export interface OverlayVizLoadingEvent {

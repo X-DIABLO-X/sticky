@@ -406,10 +406,37 @@ fn broadcast_overlay_command(
             BroadcastOutcome::None
         }
         OverlayCommand::Guide { .. }
+        | OverlayCommand::VizCue { .. }
         | OverlayCommand::PointRef { .. }
         | OverlayCommand::DrawRef { .. }
         | OverlayCommand::Raw(_) => BroadcastOutcome::None,
     }
+}
+
+/// Split an incoming LLM delta into tag-aligned segments so text before `[CUE:N]` is always
+/// pushed to TTS before the cue, and text after `[CUE:N]` is pushed after the cue.
+fn split_tag_segments(text: &str) -> Vec<&str> {
+    if !text.contains('[') && !text.contains(']') {
+        return vec![text];
+    }
+    let mut parts = Vec::new();
+    let mut start = 0;
+    for (idx, ch) in text.char_indices() {
+        if ch == '[' {
+            if idx > start {
+                parts.push(&text[start..idx]);
+            }
+            start = idx;
+        } else if ch == ']' {
+            let end = idx + 1;
+            parts.push(&text[start..end]);
+            start = end;
+        }
+    }
+    if start < text.len() {
+        parts.push(&text[start..]);
+    }
+    parts
 }
 
 async fn capture_vlm_context() -> (Option<CapturedScreen>, Vec<DetectedElement>, String) {
@@ -790,45 +817,65 @@ impl TalkController {
             match chunk_res {
                 Ok(chunk) => {
                     if let Some(text) = chunk.delta_text {
-                        let (clean, cmds) = parser.feed_token(&text);
-                        for cmd in cmds {
-                            if self.talk_session_id.load(Ordering::SeqCst) != my_session {
-                                return Ok(());
-                            }
-                            if let OverlayCommand::Guide { active } = cmd {
-                                guide_signal = Some(active);
-                            } else {
-                                match broadcast_overlay_command(&self.app_handle, &cmd, &element_map)
-                                {
-                                    BroadcastOutcome::PointResolved(id) => {
-                                        emitted_point = true;
-                                        last_pointed_element_id = Some(id);
+                        for segment in split_tag_segments(&text) {
+                            let (clean, cmds) = parser.feed_token(segment);
+                            for cmd in cmds {
+                                if self.talk_session_id.load(Ordering::SeqCst) != my_session {
+                                    return Ok(());
+                                }
+                                match cmd {
+                                    OverlayCommand::Guide { active } => {
+                                        guide_signal = Some(active);
                                     }
-                                    BroadcastOutcome::RawPointEmitted => {
-                                        emitted_point = true;
+                                    OverlayCommand::VizCue { index, caption } => {
+                                        let mut eng = self.audio_engine.lock().await;
+                                        if self.talk_session_id.load(Ordering::SeqCst) != my_session
+                                        {
+                                            return Ok(());
+                                        }
+                                        eng.push_tts_cue(index, caption).await;
                                     }
-                                    BroadcastOutcome::DrawEmitted => {
-                                        emitted_draw = true;
+                                    other => {
+                                        match broadcast_overlay_command(
+                                            &self.app_handle,
+                                            &other,
+                                            &element_map,
+                                        ) {
+                                            BroadcastOutcome::PointResolved(id) => {
+                                                emitted_point = true;
+                                                last_pointed_element_id = Some(id);
+                                            }
+                                            BroadcastOutcome::RawPointEmitted => {
+                                                emitted_point = true;
+                                            }
+                                            BroadcastOutcome::DrawEmitted => {
+                                                emitted_draw = true;
+                                            }
+                                            BroadcastOutcome::VizEmitted => {
+                                                emitted_viz = true;
+                                            }
+                                            BroadcastOutcome::None => {}
+                                        }
                                     }
-                                    BroadcastOutcome::VizEmitted => {
-                                        emitted_viz = true;
-                                    }
-                                    BroadcastOutcome::None => {}
                                 }
                             }
-                        }
-                        if !clean.is_empty() {
-                            if self.talk_session_id.load(Ordering::SeqCst) != my_session {
-                                return Ok(());
-                            }
-                            full_reply.push_str(&clean);
-                            let _ = self.app_handle.emit("bubble_update", &full_reply);
-                            let mut eng = self.audio_engine.lock().await;
-                            if self.talk_session_id.load(Ordering::SeqCst) != my_session {
-                                return Ok(());
-                            }
-                            if let Err(e) = eng.push_tts_token(&clean).await {
-                                emit_pipeline_error(&self.app_handle, "tts", e.to_string());
+                            if !clean.is_empty() {
+                                if self.talk_session_id.load(Ordering::SeqCst) != my_session {
+                                    return Ok(());
+                                }
+                                full_reply.push_str(&clean);
+                                let display_reply =
+                                    crate::audio::tts::KokoroTts::sanitize_for_speech(&full_reply);
+                                if !display_reply.is_empty() {
+                                    let _ = self.app_handle.emit("bubble_update", &display_reply);
+                                }
+                                let mut eng = self.audio_engine.lock().await;
+                                if self.talk_session_id.load(Ordering::SeqCst) != my_session {
+                                    return Ok(());
+                                }
+                                if let Err(e) = eng.push_tts_token(&clean).await {
+                                    emit_pipeline_error(&self.app_handle, "tts", e.to_string());
+                                }
                             }
                         }
                     }
@@ -852,10 +899,18 @@ impl TalkController {
             if self.talk_session_id.load(Ordering::SeqCst) != my_session {
                 return Ok(());
             }
-            if let OverlayCommand::Guide { active } = cmd {
-                guide_signal = Some(active);
-            } else {
-                match broadcast_overlay_command(&self.app_handle, &cmd, &element_map) {
+            match cmd {
+                OverlayCommand::Guide { active } => {
+                    guide_signal = Some(active);
+                }
+                OverlayCommand::VizCue { index, caption } => {
+                    let mut eng = self.audio_engine.lock().await;
+                    if self.talk_session_id.load(Ordering::SeqCst) != my_session {
+                        return Ok(());
+                    }
+                    eng.push_tts_cue(index, caption).await;
+                }
+                other => match broadcast_overlay_command(&self.app_handle, &other, &element_map) {
                     BroadcastOutcome::PointResolved(id) => {
                         emitted_point = true;
                         last_pointed_element_id = Some(id);
@@ -870,7 +925,7 @@ impl TalkController {
                         emitted_viz = true;
                     }
                     BroadcastOutcome::None => {}
-                }
+                },
             }
         }
         // If the LLM only emitted [POINT:#ID:...] without a Draw/DrawRef, auto-highlight its exact box
@@ -897,7 +952,11 @@ impl TalkController {
             }
             if !final_clean.is_empty() {
                 full_reply.push_str(&final_clean);
-                let _ = self.app_handle.emit("bubble_update", &full_reply);
+                let display_reply =
+                    crate::audio::tts::KokoroTts::sanitize_for_speech(&full_reply);
+                if !display_reply.is_empty() {
+                    let _ = self.app_handle.emit("bubble_update", &display_reply);
+                }
                 if let Err(e) = eng.push_tts_token(&final_clean).await {
                     emit_pipeline_error(&self.app_handle, "tts", e.to_string());
                 }
@@ -914,8 +973,9 @@ impl TalkController {
             return Ok(());
         }
 
-        if !full_reply.is_empty() {
-            emit_activity_log(&self.app_handle, "llm", "LLM Output Generated", &full_reply);
+        let clean_full_reply = crate::audio::tts::KokoroTts::sanitize_for_speech(&full_reply);
+        if !clean_full_reply.is_empty() {
+            emit_activity_log(&self.app_handle, "llm", "LLM Output Generated", &clean_full_reply);
             emit_activity_log(&self.app_handle, "tts", "Voice Playback Complete", "TTS audio synthesis finished.");
         }
 
@@ -945,13 +1005,13 @@ impl TalkController {
                 let mut history = self.guide_history.lock().await;
                 history.clear();
                 history.push(ChatMessage::user(transcript.clone()));
-                history.push(ChatMessage::assistant(full_reply.clone()));
+                history.push(ChatMessage::assistant(clean_full_reply.clone()));
             }
             if self.talk_session_id.load(Ordering::SeqCst) != my_session {
                 return Ok(());
             }
             self.guide_active.store(true, Ordering::SeqCst);
-            emit_guide_state(&self.app_handle, true, 1, &transcript, full_reply.trim());
+            emit_guide_state(&self.app_handle, true, 1, &transcript, &clean_full_reply);
             emit_activity_log(
                 &self.app_handle,
                 "talk",
@@ -1290,48 +1350,71 @@ impl TalkController {
             match chunk_res {
                 Ok(chunk) => {
                     if let Some(text) = chunk.delta_text {
-                        let (clean, cmds) = parser.feed_token(&text);
-                        for cmd in cmds {
-                            if self.talk_session_id.load(Ordering::SeqCst) != my_session {
-                                return Ok(());
-                            }
+                        for segment in split_tag_segments(&text) {
                             if !self.guide_active.load(Ordering::SeqCst) {
                                 break;
                             }
-                            if let OverlayCommand::Guide { active } = cmd {
-                                guide_signal = Some(active);
-                            } else {
-                                match broadcast_overlay_command(&self.app_handle, &cmd, &element_map)
-                                {
-                                    BroadcastOutcome::PointResolved(id) => {
-                                        last_pointed_element_id = Some(id);
+                            let (clean, cmds) = parser.feed_token(segment);
+                            for cmd in cmds {
+                                if self.talk_session_id.load(Ordering::SeqCst) != my_session {
+                                    return Ok(());
+                                }
+                                if !self.guide_active.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                                match cmd {
+                                    OverlayCommand::Guide { active } => {
+                                        guide_signal = Some(active);
                                     }
-                                    BroadcastOutcome::RawPointEmitted => {}
-                                    BroadcastOutcome::DrawEmitted => {
-                                        emitted_draw = true;
+                                    OverlayCommand::VizCue { index, caption } => {
+                                        let mut eng = self.audio_engine.lock().await;
+                                        if self.talk_session_id.load(Ordering::SeqCst) != my_session
+                                        {
+                                            return Ok(());
+                                        }
+                                        eng.push_tts_cue(index, caption).await;
                                     }
-                                    BroadcastOutcome::VizEmitted => {
-                                        emitted_viz = true;
+                                    other => {
+                                        match broadcast_overlay_command(
+                                            &self.app_handle,
+                                            &other,
+                                            &element_map,
+                                        ) {
+                                            BroadcastOutcome::PointResolved(id) => {
+                                                last_pointed_element_id = Some(id);
+                                            }
+                                            BroadcastOutcome::RawPointEmitted => {}
+                                            BroadcastOutcome::DrawEmitted => {
+                                                emitted_draw = true;
+                                            }
+                                            BroadcastOutcome::VizEmitted => {
+                                                emitted_viz = true;
+                                            }
+                                            BroadcastOutcome::None => {}
+                                        }
                                     }
-                                    BroadcastOutcome::None => {}
                                 }
                             }
-                        }
-                        if !clean.is_empty() {
-                            if self.talk_session_id.load(Ordering::SeqCst) != my_session {
-                                return Ok(());
-                            }
-                            if !self.guide_active.load(Ordering::SeqCst) {
-                                break;
-                            }
-                            full_reply.push_str(&clean);
-                            let _ = self.app_handle.emit("bubble_update", &full_reply);
-                            let mut eng = self.audio_engine.lock().await;
-                            if self.talk_session_id.load(Ordering::SeqCst) != my_session {
-                                return Ok(());
-                            }
-                            if let Err(e) = eng.push_tts_token(&clean).await {
-                                emit_pipeline_error(&self.app_handle, "tts", e.to_string());
+                            if !clean.is_empty() {
+                                if self.talk_session_id.load(Ordering::SeqCst) != my_session {
+                                    return Ok(());
+                                }
+                                if !self.guide_active.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                                full_reply.push_str(&clean);
+                                let display_reply =
+                                    crate::audio::tts::KokoroTts::sanitize_for_speech(&full_reply);
+                                if !display_reply.is_empty() {
+                                    let _ = self.app_handle.emit("bubble_update", &display_reply);
+                                }
+                                let mut eng = self.audio_engine.lock().await;
+                                if self.talk_session_id.load(Ordering::SeqCst) != my_session {
+                                    return Ok(());
+                                }
+                                if let Err(e) = eng.push_tts_token(&clean).await {
+                                    emit_pipeline_error(&self.app_handle, "tts", e.to_string());
+                                }
                             }
                         }
                     }
@@ -1359,21 +1442,31 @@ impl TalkController {
                 if !self.guide_active.load(Ordering::SeqCst) {
                     break;
                 }
-                if let OverlayCommand::Guide { active } = cmd {
-                    guide_signal = Some(active);
-                } else {
-                    match broadcast_overlay_command(&self.app_handle, &cmd, &element_map) {
-                        BroadcastOutcome::PointResolved(id) => {
-                            last_pointed_element_id = Some(id);
+                match cmd {
+                    OverlayCommand::Guide { active } => {
+                        guide_signal = Some(active);
+                    }
+                    OverlayCommand::VizCue { index, caption } => {
+                        let mut eng = self.audio_engine.lock().await;
+                        if self.talk_session_id.load(Ordering::SeqCst) != my_session {
+                            return Ok(());
                         }
-                        BroadcastOutcome::RawPointEmitted => {}
-                        BroadcastOutcome::DrawEmitted => {
-                            emitted_draw = true;
+                        eng.push_tts_cue(index, caption).await;
+                    }
+                    other => {
+                        match broadcast_overlay_command(&self.app_handle, &other, &element_map) {
+                            BroadcastOutcome::PointResolved(id) => {
+                                last_pointed_element_id = Some(id);
+                            }
+                            BroadcastOutcome::RawPointEmitted => {}
+                            BroadcastOutcome::DrawEmitted => {
+                                emitted_draw = true;
+                            }
+                            BroadcastOutcome::VizEmitted => {
+                                emitted_viz = true;
+                            }
+                            BroadcastOutcome::None => {}
                         }
-                        BroadcastOutcome::VizEmitted => {
-                            emitted_viz = true;
-                        }
-                        BroadcastOutcome::None => {}
                     }
                 }
             }
@@ -1405,7 +1498,11 @@ impl TalkController {
                 if self.guide_active.load(Ordering::SeqCst) {
                     if !final_clean.is_empty() {
                         full_reply.push_str(&final_clean);
-                        let _ = self.app_handle.emit("bubble_update", &full_reply);
+                        let display_reply =
+                            crate::audio::tts::KokoroTts::sanitize_for_speech(&full_reply);
+                        if !display_reply.is_empty() {
+                            let _ = self.app_handle.emit("bubble_update", &display_reply);
+                        }
                         if let Err(e) = eng.push_tts_token(&final_clean).await {
                             emit_pipeline_error(&self.app_handle, "tts", e.to_string());
                         }
@@ -1424,19 +1521,20 @@ impl TalkController {
             return Ok(());
         }
 
-        if !full_reply.is_empty() {
+        let clean_full_reply = crate::audio::tts::KokoroTts::sanitize_for_speech(&full_reply);
+        if !clean_full_reply.is_empty() {
             emit_activity_log(
                 &self.app_handle,
                 "llm",
                 &format!("Guide Step {} Reply", step_num),
-                &full_reply,
+                &clean_full_reply,
             );
             let mut history = self.guide_history.lock().await;
             history.push(ChatMessage::user(format!(
                 "I clicked at ({}, {}) for step {}.",
                 click_x, click_y, step_num
             )));
-            history.push(ChatMessage::assistant(full_reply.clone()));
+            history.push(ChatMessage::assistant(clean_full_reply.clone()));
         }
 
         {
@@ -1453,7 +1551,7 @@ impl TalkController {
         }
 
         if guide_signal == Some(true) && self.guide_active.load(Ordering::SeqCst) {
-            emit_guide_state(&self.app_handle, true, step_num, &goal, full_reply.trim());
+            emit_guide_state(&self.app_handle, true, step_num, &goal, &clean_full_reply);
             self.spawn_guide_click_watcher();
         } else {
             self.guide_active.store(false, Ordering::SeqCst);

@@ -73,6 +73,10 @@ impl AudioEngine {
         self.stt.set_groq_api_key(key);
     }
 
+    pub fn set_app_handle(&self, app: tauri::AppHandle) {
+        self.tts.set_app_handle(app);
+    }
+
     pub fn set_input_device(&mut self, device_name: Option<String>) {
         let normalized = normalize_device_name(device_name);
         let changed = self.selected_input_device != normalized;
@@ -248,6 +252,10 @@ impl AudioEngine {
 
     pub async fn push_tts_token(&mut self, token: &str) -> Result<()> {
         self.tts.push_token(token).await
+    }
+
+    pub async fn push_tts_cue(&mut self, index: usize, caption: Option<String>) {
+        self.tts.push_cue(index, caption).await;
     }
 
     pub async fn flush_tts(&mut self) -> Result<()> {

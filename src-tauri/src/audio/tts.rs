@@ -1,10 +1,12 @@
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
+use regex::Regex;
 use serde::Deserialize;
+use tauri::Emitter;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::{mpsc, Mutex};
@@ -253,26 +255,35 @@ impl TtsDaemon {
     }
 }
 
+enum TtsQueueItem {
+    Speak(u64, String),
+    Cue(u64, usize, Option<String>),
+}
+
 pub struct KokoroTts {
     output_handle: Arc<Mutex<Option<AudioOutputHandle>>>,
     daemon: Arc<Mutex<Option<TtsDaemon>>>,
+    app_handle: Arc<std::sync::Mutex<Option<tauri::AppHandle>>>,
     current_gen: Arc<AtomicU64>,
-    queue_tx: mpsc::UnboundedSender<(u64, String)>,
+    queue_tx: mpsc::UnboundedSender<TtsQueueItem>,
     text_buffer: String,
 }
 
 impl KokoroTts {
     pub fn new(output_handle: Arc<Mutex<Option<AudioOutputHandle>>>) -> Self {
         let daemon: Arc<Mutex<Option<TtsDaemon>>> = Arc::new(Mutex::new(None));
+        let app_handle: Arc<std::sync::Mutex<Option<tauri::AppHandle>>> =
+            Arc::new(std::sync::Mutex::new(None));
         let current_gen = Arc::new(AtomicU64::new(0));
-        let (queue_tx, queue_rx) = mpsc::unbounded_channel::<(u64, String)>();
+        let (queue_tx, queue_rx) = mpsc::unbounded_channel::<TtsQueueItem>();
 
         let worker_output = Arc::clone(&output_handle);
         let worker_daemon = Arc::clone(&daemon);
+        let worker_app = Arc::clone(&app_handle);
         let worker_gen = Arc::clone(&current_gen);
 
         let worker_future = async move {
-            Self::worker_loop(queue_rx, worker_output, worker_daemon, worker_gen).await;
+            Self::worker_loop(queue_rx, worker_output, worker_daemon, worker_app, worker_gen).await;
         };
 
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -284,16 +295,24 @@ impl KokoroTts {
         Self {
             output_handle,
             daemon,
+            app_handle,
             current_gen,
             queue_tx,
             text_buffer: String::new(),
         }
     }
 
+    pub fn set_app_handle(&self, app: tauri::AppHandle) {
+        if let Ok(mut guard) = self.app_handle.lock() {
+            *guard = Some(app);
+        }
+    }
+
     async fn worker_loop(
-        mut rx: mpsc::UnboundedReceiver<(u64, String)>,
+        mut rx: mpsc::UnboundedReceiver<TtsQueueItem>,
         output_handle: Arc<Mutex<Option<AudioOutputHandle>>>,
         daemon: Arc<Mutex<Option<TtsDaemon>>>,
+        app_handle: Arc<std::sync::Mutex<Option<tauri::AppHandle>>>,
         current_gen: Arc<AtomicU64>,
     ) {
         // Pre-warm the persistent Piper daemon in the background at startup so Turn 1 is <120ms.
@@ -307,25 +326,85 @@ impl KokoroTts {
             }
         }
 
-        while let Some((gen_id, raw_chunk)) = rx.recv().await {
-            if gen_id != current_gen.load(Ordering::SeqCst) {
-                continue;
-            }
+        let mut audio_end_at: Option<Instant> = None;
+        let mut active_gen: u64 = current_gen.load(Ordering::SeqCst);
 
-            let clean_text = Self::sanitize_for_speech(&raw_chunk);
-            if clean_text.is_empty() {
-                continue;
-            }
+        while let Some(item) = rx.recv().await {
+            match item {
+                TtsQueueItem::Speak(gen_id, raw_chunk) => {
+                    if gen_id != current_gen.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    if gen_id != active_gen {
+                        audio_end_at = None;
+                        active_gen = gen_id;
+                    }
 
-            if let Err(e) = Self::synthesize_and_enqueue_audio(
-                &daemon,
-                &output_handle,
-                &clean_text,
-                Some((&current_gen, gen_id)),
-            )
-            .await
-            {
-                eprintln!("[TTS] Worker synthesis error: {e}");
+                    let clean_text = Self::sanitize_for_speech(&raw_chunk);
+                    if clean_text.is_empty() {
+                        continue;
+                    }
+
+                    match Self::synthesize_and_enqueue_audio(
+                        &daemon,
+                        &output_handle,
+                        &clean_text,
+                        Some((&current_gen, gen_id)),
+                    )
+                    .await
+                    {
+                        Ok(audio_dur) => {
+                            if gen_id == current_gen.load(Ordering::SeqCst)
+                                && !audio_dur.is_zero()
+                            {
+                                let now = Instant::now();
+                                let base = audio_end_at.map(|t| t.max(now)).unwrap_or(now);
+                                audio_end_at = Some(base + audio_dur);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[TTS] Worker synthesis error: {e}");
+                        }
+                    }
+                }
+                TtsQueueItem::Cue(gen_id, index, caption) => {
+                    if gen_id != current_gen.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    if gen_id != active_gen {
+                        audio_end_at = None;
+                        active_gen = gen_id;
+                    }
+
+                    if let Some(target_end) = audio_end_at {
+                        while Instant::now() < target_end {
+                            if gen_id != current_gen.load(Ordering::SeqCst) {
+                                break;
+                            }
+                            let remaining = target_end.saturating_duration_since(Instant::now());
+                            let sleep_dur = remaining.min(Duration::from_millis(40));
+                            if sleep_dur.is_zero() {
+                                break;
+                            }
+                            tokio::time::sleep(sleep_dur).await;
+                        }
+                    }
+
+                    if gen_id != current_gen.load(Ordering::SeqCst) {
+                        continue;
+                    }
+
+                    let maybe_app = app_handle.lock().ok().and_then(|g| g.clone());
+                    if let Some(app) = maybe_app {
+                        let _ = app.emit(
+                            "overlay:viz_cue",
+                            serde_json::json!({
+                                "index": index,
+                                "caption": caption,
+                            }),
+                        );
+                    }
+                }
             }
         }
     }
@@ -340,18 +419,30 @@ impl KokoroTts {
             let chunk = std::mem::replace(&mut self.text_buffer, remainder);
             if !chunk.trim().is_empty() {
                 let gen_id = self.current_gen.load(Ordering::SeqCst);
-                let _ = self.queue_tx.send((gen_id, chunk));
+                let _ = self.queue_tx.send(TtsQueueItem::Speak(gen_id, chunk));
             }
         }
 
         Ok(())
     }
 
+    /// Flush any preceding buffered speech, then queue a voice-synced animation beat cue.
+    pub async fn push_cue(&mut self, index: usize, caption: Option<String>) {
+        let gen_id = self.current_gen.load(Ordering::SeqCst);
+        if !self.text_buffer.trim().is_empty() {
+            let chunk = std::mem::take(&mut self.text_buffer);
+            let _ = self.queue_tx.send(TtsQueueItem::Speak(gen_id, chunk));
+        } else {
+            self.text_buffer.clear();
+        }
+        let _ = self.queue_tx.send(TtsQueueItem::Cue(gen_id, index, caption));
+    }
+
     pub async fn flush_remaining(&mut self) -> Result<()> {
         if !self.text_buffer.trim().is_empty() {
             let chunk = std::mem::take(&mut self.text_buffer);
             let gen_id = self.current_gen.load(Ordering::SeqCst);
-            let _ = self.queue_tx.send((gen_id, chunk));
+            let _ = self.queue_tx.send(TtsQueueItem::Speak(gen_id, chunk));
         } else {
             self.text_buffer.clear();
         }
@@ -377,6 +468,7 @@ impl KokoroTts {
 
         Self::synthesize_and_enqueue_audio(&self.daemon, &self.output_handle, &clean_text, None)
             .await
+            .map(|_| ())
     }
 
     /// Find the byte index right after a natural speech boundary:
@@ -437,21 +529,96 @@ impl KokoroTts {
         None
     }
 
-    /// Strips Markdown syntax so TTS speaks natural prose without reading asterisks/backticks.
-    fn sanitize_for_speech(input: &str) -> String {
-        input
-            .replace("```", " ")
-            .replace('`', "")
-            .replace("**", "")
-            .replace("__", "")
-            .replace("###", "")
-            .replace("##", "")
+    /// Strips Markdown, LaTeX delimiters, and formatting symbols so TTS & speech bubbles
+    /// speak and display clean natural prose without reading asterisks or backticks.
+    pub fn sanitize_for_speech(input: &str) -> String {
+        static RE_IMAGE: OnceLock<Regex> = OnceLock::new();
+        static RE_LINK: OnceLock<Regex> = OnceLock::new();
+        static RE_FENCE_OPEN: OnceLock<Regex> = OnceLock::new();
+        static RE_HEADING: OnceLock<Regex> = OnceLock::new();
+        static RE_BLOCKQUOTE: OnceLock<Regex> = OnceLock::new();
+        static RE_BULLET: OnceLock<Regex> = OnceLock::new();
+        static RE_LATEX_INLINE: OnceLock<Regex> = OnceLock::new();
+        static RE_LATEX_OPEN_SPLIT: OnceLock<Regex> = OnceLock::new();
+        static RE_LATEX_CLOSE_SPLIT: OnceLock<Regex> = OnceLock::new();
+        static RE_ITALIC_UNDER: OnceLock<Regex> = OnceLock::new();
+
+        let re_image = RE_IMAGE.get_or_init(|| Regex::new(r"!\[([^\]]*)\]\([^)]*\)").unwrap());
+        let re_link = RE_LINK.get_or_init(|| Regex::new(r"\[([^\]]+)\]\([^)]*\)").unwrap());
+        let re_fence_open =
+            RE_FENCE_OPEN.get_or_init(|| Regex::new(r"```[a-zA-Z0-9_-]*\s*\n").unwrap());
+        let re_heading = RE_HEADING.get_or_init(|| Regex::new(r"(?m)^\s*#{1,6}\s*").unwrap());
+        let re_blockquote = RE_BLOCKQUOTE.get_or_init(|| Regex::new(r"(?m)^\s*>\s*").unwrap());
+        let re_bullet =
+            RE_BULLET.get_or_init(|| Regex::new(r"(?m)^\s*(?:[-•▪]\s+)+").unwrap());
+        let re_latex_inline = RE_LATEX_INLINE
+            .get_or_init(|| Regex::new(r"\$([^\s$](?:[^$]*[^\s$])?)\$").unwrap());
+        let re_latex_open_split =
+            RE_LATEX_OPEN_SPLIT.get_or_init(|| Regex::new(r"\$([a-zA-Z\\])").unwrap());
+        let re_latex_close_split =
+            RE_LATEX_CLOSE_SPLIT.get_or_init(|| Regex::new(r"([a-zA-Z0-9}\)])\$").unwrap());
+        let re_italic_under = RE_ITALIC_UNDER.get_or_init(|| {
+            Regex::new(r#"(^|[\s"'(\[{])_+([^_\s](?:[^_]*?[^_\s])?)_+([\s"')\]},.!?;:]|$)"#)
+                .unwrap()
+        });
+
+        // 1. Convert markdown images & links to their human-readable alt/label text
+        let s = re_image.replace_all(input, "$1");
+        let s = re_link.replace_all(&s, "$1");
+
+        // 2. Strip fenced code block headers/markers and inline backticks
+        let s = re_fence_open.replace_all(&s, " ");
+        let s = s.replace("```", " ").replace('`', "");
+
+        // 3. Turn arrow notations into natural spoken English
+        let s = s
+            .replace("->", " to ")
+            .replace('→', " to ")
+            .replace("=>", " to ");
+
+        // 4. Strip line-leading markdown syntax before collapsing newlines
+        let s = re_blockquote.replace_all(&s, "");
+        let s = re_bullet.replace_all(&s, "");
+        let s = re_heading.replace_all(&s, "");
+
+        // 5. Strip strikethrough, asterisks, heading hashes, bullet glyphs, and double underscores
+        let s = s
+            .replace("~~", "")
+            .replace('*', "")
             .replace('#', "")
-            .replace('\r', " ")
+            .replace('•', " ")
+            .replace('▪', " ")
+            .replace("__", "");
+
+        // 6. Strip LaTeX $ delimiters (complete and chunk-split) while preserving currency like $50
+        let s = s.replace("$$", "");
+        let s = re_latex_inline.replace_all(&s, "$1");
+        let s = re_latex_open_split.replace_all(&s, "$1");
+        let s = re_latex_close_split.replace_all(&s, "$1");
+
+        // 7. Strip italic _word_ / _phrase_ delimiters (2 passes handle adjacent "_a_ _b_")
+        let s = re_italic_under.replace_all(&s, "$1$2$3");
+        let s = re_italic_under.replace_all(&s, "$1$2$3");
+
+        // 8. Collapse all whitespace cleanly
+        s.replace('\r', " ")
             .replace('\n', " ")
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    fn pcm_duration(sample_count: usize, sample_rate: u32, channels: u16) -> Duration {
+        if sample_count == 0 || sample_rate == 0 {
+            return Duration::ZERO;
+        }
+        let ch = channels.max(1) as f64;
+        let secs = (sample_count as f64) / (sample_rate as f64 * ch);
+        if secs.is_finite() && secs > 0.0 {
+            Duration::from_secs_f64(secs)
+        } else {
+            Duration::ZERO
+        }
     }
 
     async fn synthesize_via_daemon(
@@ -505,10 +672,10 @@ impl KokoroTts {
         output_handle: &Arc<Mutex<Option<AudioOutputHandle>>>,
         clean_text: &str,
         gen_check: Option<(&Arc<AtomicU64>, u64)>,
-    ) -> Result<()> {
+    ) -> Result<Duration> {
         if let Some((atomic, expected)) = gen_check {
             if atomic.load(Ordering::SeqCst) != expected {
-                return Ok(());
+                return Ok(Duration::ZERO);
             }
         }
 
@@ -516,15 +683,16 @@ impl KokoroTts {
         match Self::synthesize_via_daemon(daemon, clean_text).await {
             Ok(pcm) => {
                 if pcm.samples.is_empty() {
-                    return Ok(());
+                    return Ok(Duration::ZERO);
                 }
                 if let Some((atomic, expected)) = gen_check {
                     if atomic.load(Ordering::SeqCst) != expected {
-                        return Ok(());
+                        return Ok(Duration::ZERO);
                     }
                 }
-                return Self::play_pcm(output_handle, pcm.samples, pcm.sample_rate, pcm.channels)
-                    .await;
+                let dur = Self::pcm_duration(pcm.samples.len(), pcm.sample_rate, pcm.channels);
+                Self::play_pcm(output_handle, pcm.samples, pcm.sample_rate, pcm.channels).await?;
+                return Ok(dur);
             }
             Err(e) => {
                 eprintln!("[TTS] Neural daemon unavailable, falling back to OS TTS: {e}");
@@ -533,7 +701,7 @@ impl KokoroTts {
 
         if let Some((atomic, expected)) = gen_check {
             if atomic.load(Ordering::SeqCst) != expected {
-                return Ok(());
+                return Ok(Duration::ZERO);
             }
         }
 
@@ -580,7 +748,7 @@ impl KokoroTts {
         output_handle: &Arc<Mutex<Option<AudioOutputHandle>>>,
         clean_text: &str,
         gen_check: Option<(&Arc<AtomicU64>, u64)>,
-    ) -> Result<()> {
+    ) -> Result<Duration> {
         #[cfg(target_os = "macos")]
         {
             let _ = (output_handle, gen_check);
@@ -594,7 +762,7 @@ impl KokoroTts {
                     "macOS `say` exited with non-zero status".into(),
                 ));
             }
-            return Ok(());
+            return Ok(Duration::ZERO);
         }
 
         #[cfg(target_os = "linux")]
@@ -616,7 +784,7 @@ impl KokoroTts {
                         AppError::Audio(format!("Linux TTS (`espeak-ng`/`spd-say`) failed: {e}"))
                     })?;
             }
-            return Ok(());
+            return Ok(Duration::ZERO);
         }
 
         #[cfg(target_os = "windows")]
@@ -668,12 +836,60 @@ impl KokoroTts {
 
             if let Some((atomic, expected)) = gen_check {
                 if atomic.load(Ordering::SeqCst) != expected {
-                    return Ok(());
+                    return Ok(Duration::ZERO);
                 }
             }
 
             let (samples, sample_rate, channels) = Self::decode_wav_bytes(wav_bytes)?;
-            Self::play_pcm(output_handle, samples, sample_rate, channels).await
+            let dur = Self::pcm_duration(samples.len(), sample_rate, channels);
+            Self::play_pcm(output_handle, samples, sample_rate, channels).await?;
+            Ok(dur)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sanitize_for_speech_strips_all_markdown_and_asterisks() {
+        let raw = concat!(
+            "## Heading\n",
+            "> Quoted intro with *single*, **bold**, and split * asterisk.\n",
+            "- bullet item with _italic_ and _two words_ and __strong__\n",
+            "• another bullet and ▪ third bullet\n",
+            "Check `code` and ```js\nlet x = 1;\n``` or ~~old~~ text.\n",
+            "Visit [Click here](https://x.com) and ![Alt diagram](https://x.com/img.png).\n",
+            "Flow: A -> B → C => D and math $x^2$ plus $$a + b$$."
+        );
+
+        let cleaned = KokoroTts::sanitize_for_speech(raw);
+
+        assert!(!cleaned.contains('*'), "asterisks leaked: {cleaned}");
+        assert!(!cleaned.contains('`'), "backticks leaked: {cleaned}");
+        assert!(!cleaned.contains('#'), "headings leaked: {cleaned}");
+        assert!(!cleaned.contains('~'), "strikethrough leaked: {cleaned}");
+        assert!(!cleaned.contains('$'), "LaTeX $ leaked: {cleaned}");
+        assert!(!cleaned.contains('_'), "italic underscores leaked: {cleaned}");
+        assert!(!cleaned.contains("https://"), "link URL leaked: {cleaned}");
+        assert!(!cleaned.contains("->"), "ASCII arrow leaked: {cleaned}");
+        assert!(!cleaned.contains('→'), "unicode arrow leaked: {cleaned}");
+        assert!(!cleaned.contains("=>"), "fat arrow leaked: {cleaned}");
+        assert!(!cleaned.contains('•'), "bullet symbol leaked: {cleaned}");
+        assert!(!cleaned.contains('▪'), "square bullet leaked: {cleaned}");
+        assert!(!cleaned.contains('>'), "blockquote marker leaked: {cleaned}");
+
+        assert!(cleaned.contains("Heading"), "{cleaned}");
+        assert!(cleaned.contains("single, bold, and split asterisk."), "{cleaned}");
+        assert!(cleaned.contains("bullet item with italic and two words and strong"), "{cleaned}");
+        assert!(cleaned.contains("Check code and let x = 1; or old text."), "{cleaned}");
+        assert!(cleaned.contains("Visit Click here and Alt diagram."), "{cleaned}");
+        assert!(cleaned.contains("Flow: A to B to C to D"), "{cleaned}");
+        assert!(cleaned.contains("math x^2 plus a + b."), "{cleaned}");
+
+        // Normal snake_case identifiers and currency should remain intact
+        let mixed = KokoroTts::sanitize_for_speech("Use snake_case_var for $50 and _emphasis_.");
+        assert_eq!(mixed, "Use snake_case_var for $50 and emphasis.");
     }
 }

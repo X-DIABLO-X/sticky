@@ -43,6 +43,10 @@ pub enum OverlayCommand {
         width: Option<u32>,
         height: Option<u32>,
     },
+    VizCue {
+        index: usize,
+        caption: Option<String>,
+    },
     VizClose,
     Step {
         index: usize,
@@ -272,11 +276,12 @@ fn parse_viz_open_tag(content: &str) -> Option<(String, String, Option<u32>, Opt
         return None;
     }
 
-    let kind = parts[1].trim().to_lowercase();
-    match kind.as_str() {
-        "html" | "canvas" | "svg" | "mermaid" | "three" | "chart" => {}
+    let raw_kind = parts[1].trim().to_lowercase();
+    let kind = match raw_kind.as_str() {
+        "html" | "canvas" | "svg" | "mermaid" | "three" | "chart" | "anim" => raw_kind,
+        "manim" => "anim".to_string(),
         _ => return None,
-    }
+    };
 
     let (title, width, height) = if parts.len() >= 4 {
         if let Some((w, h)) = parse_dimensions(parts[parts.len() - 1]) {
@@ -503,6 +508,25 @@ fn parse_tag(content: &str) -> Option<OverlayCommand> {
                 }
             }
             None
+        }
+        "CUE" => {
+            // [CUE:0], [CUE:1], [CUE:2:Converge to Minimum]
+            if parts.len() >= 2 {
+                let index = parts[1].trim().parse::<usize>().ok()?;
+                let caption = if parts.len() >= 3 {
+                    let cap = parts[2..].join(":").trim().to_string();
+                    if cap.is_empty() {
+                        None
+                    } else {
+                        Some(cap)
+                    }
+                } else {
+                    None
+                };
+                Some(OverlayCommand::VizCue { index, caption })
+            } else {
+                None
+            }
         }
         "STEP" => {
             // [STEP:idx/total:x1,y1,x2,y2:instruction]
@@ -1070,6 +1094,98 @@ mod tests {
                 assert_eq!(coords.len(), 200);
             }
             other => panic!("Expected long polyline Draw, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cue_and_manim_viz_tags() {
+        let mut parser = TagStreamParser::new();
+        let tokens = vec![
+            "Let me animate this! ",
+            "[VIZ:manim:Gradient Descent]\n",
+            "scene.beat(0, \"Plot\", \"Curve\", (tl) => {});\n",
+            "[/VIZ] ",
+            "[CUE:0] First we plot the curve. ",
+            "[cue:1:Step Two] Next we roll downhill. ",
+            "[C",
+            "UE:2:Converge to Minimum] Finally we settle at zero.",
+        ];
+
+        let mut all_clean = String::new();
+        let mut all_cmds = Vec::new();
+        for t in tokens {
+            let (clean, cmds) = parser.feed_token(t);
+            all_clean.push_str(&clean);
+            all_cmds.extend(cmds);
+        }
+        let (clean, cmds) = parser.flush();
+        all_clean.push_str(&clean);
+        all_cmds.extend(cmds);
+
+        assert_eq!(
+            all_clean,
+            "Let me animate this! First we plot the curve. Next we roll downhill. Finally we settle at zero."
+        );
+        assert!(!all_clean.contains("CUE"));
+        assert!(!all_clean.contains("VIZ"));
+        assert_eq!(all_cmds.len(), 5);
+
+        assert_eq!(
+            all_cmds[0],
+            OverlayCommand::VizLoading {
+                kind: "anim".to_string(),
+                title: "Gradient Descent".to_string(),
+            }
+        );
+        match &all_cmds[1] {
+            OverlayCommand::VizRender {
+                kind, title, code, ..
+            } => {
+                assert_eq!(kind, "anim");
+                assert_eq!(title, "Gradient Descent");
+                assert_eq!(code, "scene.beat(0, \"Plot\", \"Curve\", (tl) => {});");
+            }
+            other => panic!("Expected VizRender with normalized kind 'anim', got {:?}", other),
+        }
+        assert_eq!(
+            all_cmds[2],
+            OverlayCommand::VizCue {
+                index: 0,
+                caption: None,
+            }
+        );
+        assert_eq!(
+            all_cmds[3],
+            OverlayCommand::VizCue {
+                index: 1,
+                caption: Some("Step Two".to_string()),
+            }
+        );
+        assert_eq!(
+            all_cmds[4],
+            OverlayCommand::VizCue {
+                index: 2,
+                caption: Some("Converge to Minimum".to_string()),
+            }
+        );
+
+        // Also verify direct [VIZ:anim:...] works identically
+        let mut anim_parser = TagStreamParser::new();
+        let (c, cmds) = anim_parser.feed_token("[VIZ:anim:Spring]scene.beat(0, \"Go\", \"\", () => {});[/VIZ]");
+        assert_eq!(c, "");
+        assert_eq!(
+            cmds[0],
+            OverlayCommand::VizLoading {
+                kind: "anim".to_string(),
+                title: "Spring".to_string(),
+            }
+        );
+        match &cmds[1] {
+            OverlayCommand::VizRender { kind, title, .. } => {
+                assert_eq!(kind, "anim");
+                assert_eq!(title, "Spring");
+            }
+            other => panic!("Expected VizRender 'anim', got {:?}", other),
         }
     }
 }

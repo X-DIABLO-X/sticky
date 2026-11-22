@@ -8,6 +8,7 @@ import React, {
 } from "react";
 import * as THREE from "three";
 import mermaid from "mermaid";
+import "katex/dist/katex.min.css";
 import {
   AlertTriangle,
   BarChart3,
@@ -31,14 +32,21 @@ import {
   ZoomOut,
 } from "lucide-react";
 import type {
+  OverlayVizCueEvent,
   OverlayVizEvent,
   OverlayVizLoadingEvent,
   VizKind,
 } from "../../types/events";
+import {
+  mountManimScene,
+  type ManimBeatInfo,
+  type ManimController,
+} from "./manimEngine";
 
 export interface VisualizationStageProps {
   viz: OverlayVizEvent | null;
   loading?: OverlayVizLoadingEvent | null;
+  activeCue?: OverlayVizCueEvent | null;
   onClose: () => void;
   onRectChange?: (rect: DOMRect | null) => void;
 }
@@ -119,6 +127,13 @@ function getEngineMeta(kind: VizKind | string): {
         badgeClass:
           "bg-teal-500/15 text-teal-300 border border-teal-400/35",
         icon: <BarChart3 className="w-3 h-3" />,
+      };
+    case "anim":
+      return {
+        label: "MANIM ANIM",
+        badgeClass:
+          "bg-gradient-to-r from-emerald-500/20 via-teal-500/20 to-indigo-500/25 text-emerald-200 border border-emerald-400/45 shadow-[0_0_12px_rgba(16,185,129,0.28)]",
+        icon: <Sparkles className="w-3 h-3 text-emerald-300" />,
       };
     case "html":
     case "canvas":
@@ -1551,12 +1566,406 @@ const ChartEngine: React.FC<{ code: string; reloadKey: number }> = ({
 };
 
 /* ============================================================================
+ * 6. 3BLUE1BROWN-STYLE MANIM CINEMATIC ANIMATION ENGINE
+ * ============================================================================ */
+
+const MANIM_SPEEDS = [0.5, 1, 1.5] as const;
+
+function formatManimTime(seconds: number): string {
+  const safe = Number.isFinite(seconds) && seconds > 0 ? seconds : 0;
+  const totalSec = Math.floor(safe);
+  const mins = Math.floor(totalSec / 60);
+  const secs = totalSec % 60;
+  return `${mins}:${secs.toString().padStart(2, "0")}`;
+}
+
+const ManimEngine: React.FC<{
+  code: string;
+  reloadKey: number;
+  activeCue?: OverlayVizCueEvent | null;
+}> = ({ code, reloadKey, activeCue = null }) => {
+  const stageHostRef = useRef<HTMLDivElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const overlayLayerRef = useRef<HTMLDivElement | null>(null);
+  const controllerRef = useRef<ManimController | null>(null);
+
+  const [playing, setPlaying] = useState(true);
+  const [time, setTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [activeBeatIndex, setActiveBeatIndex] = useState(0);
+  const [sceneSubtitle, setSceneSubtitle] = useState("");
+  const [beats, setBeats] = useState<ManimBeatInfo[]>([]);
+  const [speed, setSpeed] = useState<number>(1);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [cueCaption, setCueCaption] = useState<{
+    beatIndex: number;
+    text: string;
+  } | null>(null);
+
+  const speedRef = useRef(speed);
+  speedRef.current = speed;
+  const prevBeatRef = useRef<number>(0);
+  const lastCueSeqRef = useRef<number | null>(null);
+
+  // Reset playback speed to 1x when a new animation script arrives
+  useEffect(() => {
+    setSpeed(1);
+    speedRef.current = 1;
+  }, [code]);
+
+  // Mount Manim scene + ResizeObserver + clean disposal
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const overlayLayer = overlayLayerRef.current;
+    const host = stageHostRef.current;
+    if (!canvas || !overlayLayer || !host) return;
+
+    setErrorMsg(null);
+    setCueCaption(null);
+    setPlaying(true);
+    setTime(0);
+    setActiveBeatIndex(0);
+    setSceneSubtitle("");
+    setBeats([]);
+    prevBeatRef.current = 0;
+    overlayLayer.innerHTML = "";
+
+    let receivedState = false;
+    let controller: ManimController | null = null;
+
+    try {
+      controller = mountManimScene({
+        canvas,
+        overlayLayer,
+        code: stripCodeFences(code),
+        onStateChange: (state) => {
+          receivedState = true;
+          setPlaying(state.playing);
+          setTime(state.time);
+          setDuration(state.duration);
+          setActiveBeatIndex(state.activeBeatIndex);
+          setSceneSubtitle(state.subtitle || "");
+
+          if (prevBeatRef.current !== state.activeBeatIndex) {
+            prevBeatRef.current = state.activeBeatIndex;
+            setCueCaption((prev) =>
+              prev && prev.beatIndex !== state.activeBeatIndex ? null : prev
+            );
+          }
+
+          setBeats((prev) => {
+            if (
+              prev.length === state.beats.length &&
+              prev.every(
+                (b, idx) =>
+                  b.index === state.beats[idx].index &&
+                  b.title === state.beats[idx].title &&
+                  b.subtitle === state.beats[idx].subtitle &&
+                  b.startTime === state.beats[idx].startTime &&
+                  b.duration === state.beats[idx].duration
+              )
+            ) {
+              return prev;
+            }
+            return state.beats;
+          });
+        },
+        onError: (message) => {
+          setErrorMsg(message);
+        },
+      });
+
+      controllerRef.current = controller;
+
+      if (speedRef.current !== 1) {
+        controller.setSpeed(speedRef.current);
+      }
+
+      if (!receivedState) {
+        const initBeats = controller.getBeats();
+        const initDur = controller.getDuration();
+        const initTime = controller.getTime();
+        setBeats(initBeats);
+        setDuration(initDur);
+        setTime(initTime);
+        if (initBeats[0]?.subtitle) {
+          setSceneSubtitle(initBeats[0].subtitle);
+        }
+      }
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : String(err));
+    }
+
+    const resizeObserver = new ResizeObserver(() => {
+      controller?.resize();
+    });
+    resizeObserver.observe(host);
+
+    return () => {
+      resizeObserver.disconnect();
+      controllerRef.current = null;
+      try {
+        controller?.dispose();
+      } catch {
+        // Safe teardown
+      }
+      overlayLayer.innerHTML = "";
+    };
+  }, [code, reloadKey]);
+
+  // Voice-synced [CUE:N] beat advancement from Sticky TTS
+  useEffect(() => {
+    if (!activeCue) {
+      lastCueSeqRef.current = null;
+      setCueCaption(null);
+      return;
+    }
+    if (activeCue.seq === lastCueSeqRef.current) return;
+    lastCueSeqRef.current = activeCue.seq;
+
+    const ctrl = controllerRef.current;
+    const currentBeats = ctrl?.getBeats() ?? [];
+    const targetBeatIndex =
+      currentBeats.length > 0
+        ? Math.max(0, Math.min(currentBeats.length - 1, activeCue.index))
+        : activeCue.index;
+
+    if (activeCue.caption && activeCue.caption.trim()) {
+      setCueCaption({
+        beatIndex: targetBeatIndex,
+        text: activeCue.caption.trim(),
+      });
+    } else {
+      setCueCaption(null);
+    }
+
+    ctrl?.jumpToBeat(activeCue.index);
+  }, [activeCue]);
+
+  const handleTogglePlay = () => {
+    const ctrl = controllerRef.current;
+    if (!ctrl) return;
+    if (playing) {
+      ctrl.pause();
+    } else {
+      const dur = ctrl.getDuration();
+      const cur = ctrl.getTime();
+      if (dur > 0 && cur >= dur - 0.05) {
+        setCueCaption(null);
+        ctrl.restart();
+      } else {
+        ctrl.play();
+      }
+    }
+  };
+
+  const handleRestart = () => {
+    setCueCaption(null);
+    controllerRef.current?.restart();
+  };
+
+  const handleCycleSpeed = () => {
+    const idx = MANIM_SPEEDS.indexOf(speed as (typeof MANIM_SPEEDS)[number]);
+    const next = MANIM_SPEEDS[(idx + 1) % MANIM_SPEEDS.length];
+    setSpeed(next);
+    controllerRef.current?.setSpeed(next);
+  };
+
+  const handleJumpToBeat = (beatIndex: number) => {
+    setCueCaption(null);
+    controllerRef.current?.jumpToBeat(beatIndex);
+  };
+
+  const handleScrub = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const nextTime = Number(e.target.value);
+    if (!Number.isFinite(nextTime)) return;
+    setCueCaption(null);
+    setTime(nextTime);
+    controllerRef.current?.seek(nextTime);
+  };
+
+  const safeDuration = Math.max(duration, 0.01);
+  const clampedTime = Math.max(0, Math.min(safeDuration, time));
+  const progressPct = duration > 0 ? Math.min(100, Math.max(0, (clampedTime / duration) * 100)) : 0;
+
+  const activeBeat =
+    beats.find((b) => b.index === activeBeatIndex) ?? beats[activeBeatIndex];
+  const displaySubtitle =
+    cueCaption?.text || sceneSubtitle || activeBeat?.subtitle || "";
+
+  return (
+    <div className="relative w-full h-full bg-[#080c14] flex flex-col overflow-hidden select-none">
+      {/* Full-Bleed Dark Mathematical Canvas + KaTeX MathTex Overlay Layer */}
+      <div
+        ref={stageHostRef}
+        onClick={handleTogglePlay}
+        className="relative flex-1 min-h-0 w-full bg-[#080c14] overflow-hidden cursor-pointer"
+      >
+        <canvas ref={canvasRef} className="block w-full h-full" />
+        <div
+          ref={overlayLayerRef}
+          className="absolute inset-0 pointer-events-none overflow-hidden text-zinc-100"
+        />
+
+        {/* Inline non-crashing error banner for LLM-generated scripts */}
+        {errorMsg && (
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="absolute top-3 left-3 right-3 z-20 flex items-start gap-2 px-3 py-2 rounded-xl bg-rose-950/90 border border-rose-500/45 text-[11px] text-rose-200 backdrop-blur-md shadow-[0_10px_28px_rgba(0,0,0,0.65)] cursor-default"
+          >
+            <AlertTriangle className="w-3.5 h-3.5 text-rose-400 shrink-0 mt-0.5" />
+            <div className="min-w-0 flex-1">
+              <div className="text-[10px] font-bold uppercase tracking-wider text-rose-300 mb-0.5">
+                Manim Scene Error
+              </div>
+              <span className="font-mono break-all leading-snug">{errorMsg}</span>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* 3Blue1Brown Cinematic Player Bar */}
+      <div className="shrink-0 z-10 px-3 pt-2 pb-2.5 bg-gradient-to-t from-[#05080f] via-[#080c14]/[0.97] to-[#0a101c]/95 border-t border-white/[0.08] backdrop-blur-xl flex flex-col gap-2">
+        {/* Live Narrated Subtitle Strip */}
+        {displaySubtitle && (
+          <div
+            className={`px-3 py-1.5 rounded-xl border backdrop-blur-md flex items-center justify-center gap-2 transition-colors ${
+              cueCaption
+                ? "bg-emerald-500/[0.08] border-emerald-400/35 shadow-[0_0_16px_rgba(16,185,129,0.12)]"
+                : "bg-white/[0.035] border-white/[0.08]"
+            }`}
+          >
+            <span
+              className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                cueCaption
+                  ? "bg-emerald-400 animate-pulse shadow-[0_0_8px_#34d399]"
+                  : "bg-indigo-400/80"
+              }`}
+            />
+            <p className="text-[11.5px] leading-snug font-medium text-zinc-100 text-center line-clamp-2">
+              {displaySubtitle}
+            </p>
+          </div>
+        )}
+
+        {/* Clickable Beat Chapter Pills */}
+        {beats.length > 0 && (
+          <div className="flex items-center gap-1.5 overflow-x-auto pb-0.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+            {beats.map((beat, idx) => {
+              const isActive = beat.index === activeBeatIndex;
+              const label = /^\d+[.)]\s/.test(beat.title)
+                ? beat.title
+                : `${idx + 1}. ${beat.title}`;
+              return (
+                <button
+                  key={`${beat.index}-${beat.title}`}
+                  onClick={() => handleJumpToBeat(beat.index)}
+                  className={`shrink-0 px-2.5 py-1 rounded-full text-[10.5px] font-semibold border transition-all duration-150 ${
+                    isActive
+                      ? "bg-emerald-500/20 text-emerald-200 border-emerald-400/60 shadow-[0_0_14px_rgba(16,185,129,0.38)]"
+                      : "bg-white/[0.03] text-zinc-400 border-white/10 hover:text-zinc-100 hover:bg-white/[0.08] hover:border-white/20"
+                  }`}
+                  title={beat.subtitle || beat.title}
+                >
+                  {label}
+                </button>
+              );
+            })}
+          </div>
+        )}
+
+        {/* Transport Controls Row */}
+        <div className="flex items-center gap-2 pr-4">
+          {/* Play / Pause */}
+          <button
+            onClick={handleTogglePlay}
+            className="w-7 h-7 rounded-full flex items-center justify-center bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-200 border border-emerald-400/45 shadow-[0_0_10px_rgba(16,185,129,0.22)] transition-colors shrink-0"
+            title={playing ? "Pause" : "Play"}
+          >
+            {playing ? (
+              <Pause className="w-3.5 h-3.5" />
+            ) : (
+              <Play className="w-3.5 h-3.5 ml-0.5" />
+            )}
+          </button>
+
+          {/* Replay */}
+          <button
+            onClick={handleRestart}
+            className="w-7 h-7 rounded-full flex items-center justify-center bg-white/[0.05] hover:bg-white/[0.11] text-zinc-300 hover:text-white border border-white/10 transition-colors shrink-0"
+            title="Replay from Start"
+          >
+            <RotateCcw className="w-3.5 h-3.5" />
+          </button>
+
+          {/* Interactive Timeline Range Scrubber with Beat Chapter Markers */}
+          <div className="relative flex-1 h-5 flex items-center group">
+            <div className="relative w-full h-1.5 rounded-full bg-white/10 overflow-hidden">
+              <div
+                className="h-full rounded-full bg-gradient-to-r from-emerald-400 via-teal-300 to-indigo-400 shadow-[0_0_10px_rgba(16,185,129,0.55)]"
+                style={{ width: `${progressPct}%` }}
+              />
+              {duration > 0 &&
+                beats.slice(1).map((b) => {
+                  const pct = Math.max(0, Math.min(100, (b.startTime / duration) * 100));
+                  return (
+                    <span
+                      key={`tick-${b.index}`}
+                      className="absolute top-0 bottom-0 w-[1.5px] bg-[#080c14]/90 pointer-events-none"
+                      style={{ left: `${pct}%` }}
+                    />
+                  );
+                })}
+            </div>
+
+            <div
+              className="pointer-events-none absolute top-1/2 -translate-y-1/2 -translate-x-1/2 w-3 h-3 rounded-full bg-emerald-300 border-2 border-[#080c14] shadow-[0_0_10px_rgba(52,211,153,0.9)] transition-transform duration-100 group-hover:scale-125"
+              style={{ left: `${progressPct}%` }}
+            />
+
+            <input
+              type="range"
+              min={0}
+              max={safeDuration}
+              step={0.01}
+              value={clampedTime}
+              onChange={handleScrub}
+              aria-label="Animation timeline scrubber"
+              className="absolute inset-0 w-full h-full opacity-0 cursor-pointer m-0"
+            />
+          </div>
+
+          {/* Formatted Timestamp */}
+          <span className="font-mono text-[10.5px] tabular-nums text-zinc-300 shrink-0 min-w-[68px] text-right">
+            {formatManimTime(clampedTime)} / {formatManimTime(duration)}
+          </span>
+
+          {/* Speed Toggle (0.5x -> 1x -> 1.5x) */}
+          <button
+            onClick={handleCycleSpeed}
+            className={`px-2 py-0.5 rounded-md font-mono text-[10.5px] font-semibold border transition-colors shrink-0 ${
+              speed !== 1
+                ? "bg-indigo-500/20 text-indigo-200 border-indigo-400/45"
+                : "bg-white/[0.05] text-zinc-300 border-white/10 hover:text-white hover:bg-white/[0.11]"
+            }`}
+            title="Cycle Playback Speed (0.5× / 1× / 1.5×)"
+          >
+            {speed}×
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+/* ============================================================================
  * MAIN STAGE COMPONENT (DRAGGABLE, RESIZABLE, CODE INSPECTOR, LOADING CARD)
  * ============================================================================ */
 
 export const VisualizationStage: React.FC<VisualizationStageProps> = ({
   viz,
   loading = null,
+  activeCue = null,
   onClose,
   onRectChange,
 }) => {
@@ -1568,13 +1977,15 @@ export const VisualizationStage: React.FC<VisualizationStageProps> = ({
   const [isInteracting, setIsInteracting] = useState(false);
 
   const computeDefaultGeometry = useCallback(
-    (wRaw?: number, hRaw?: number) => {
+    (wRaw?: number, hRaw?: number, kind?: VizKind | string) => {
       const vw = typeof window !== "undefined" ? window.innerWidth : 1280;
       const vh = typeof window !== "undefined" ? window.innerHeight : 720;
       const maxW = Math.max(360, vw - 40);
       const maxH = Math.max(280, vh - 80);
-      const w = Math.min(maxW, Math.max(360, wRaw ?? 560));
-      const h = Math.min(maxH, Math.max(280, hRaw ?? 400));
+      const defaultW = kind === "anim" ? 600 : 560;
+      const defaultH = kind === "anim" ? 450 : 400;
+      const w = Math.min(maxW, Math.max(360, wRaw ?? defaultW));
+      const h = Math.min(maxH, Math.max(280, hRaw ?? defaultH));
       const x = Math.max(40, Math.min(vw - w - 20, vw - w - 60));
       const y = Math.max(24, Math.min(vh - h - 24, 84));
       return { x, y, w, h };
@@ -1583,7 +1994,7 @@ export const VisualizationStage: React.FC<VisualizationStageProps> = ({
   );
 
   const [geom, setGeom] = useState(() =>
-    computeDefaultGeometry(viz?.width, viz?.height)
+    computeDefaultGeometry(viz?.width, viz?.height, viz?.kind)
   );
   const prevGeomRef = useRef(geom);
 
@@ -1592,7 +2003,7 @@ export const VisualizationStage: React.FC<VisualizationStageProps> = ({
     if (!viz) return;
     setIsExpanded(false);
     setShowCode(false);
-    setGeom(computeDefaultGeometry(viz.width, viz.height));
+    setGeom(computeDefaultGeometry(viz.width, viz.height, viz.kind));
   }, [viz?.id, viz?.kind, viz?.title, viz?.width, viz?.height, computeDefaultGeometry]);
 
   // Keep stage inside viewport when OS window resizes
@@ -1894,6 +2305,13 @@ export const VisualizationStage: React.FC<VisualizationStageProps> = ({
         {viz.kind === "chart" && (
           <ChartEngine code={viz.code} reloadKey={reloadKey} />
         )}
+        {viz.kind === "anim" && (
+          <ManimEngine
+            code={viz.code}
+            reloadKey={reloadKey}
+            activeCue={activeCue}
+          />
+        )}
 
         {/* Transparent drag/resize shield so sandboxed iframes never steal pointer move */}
         {isInteracting && (
@@ -1905,7 +2323,7 @@ export const VisualizationStage: React.FC<VisualizationStageProps> = ({
           <div className="absolute inset-0 z-20 bg-zinc-950/95 backdrop-blur-md flex flex-col select-text">
             <div className="shrink-0 px-3.5 py-2 flex items-center justify-between border-b border-white/10 bg-zinc-900/75">
               <span className="text-[11px] font-mono text-zinc-400">
-                source.{viz.kind === "three" ? "js" : viz.kind === "chart" ? "json" : viz.kind} ·{" "}
+                source.{viz.kind === "three" || viz.kind === "anim" ? "js" : viz.kind === "chart" ? "json" : viz.kind} ·{" "}
                 {viz.code.length.toLocaleString()} chars
               </span>
               <button

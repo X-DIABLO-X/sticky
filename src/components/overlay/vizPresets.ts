@@ -769,10 +769,325 @@ const INTERACTIVE_CHART_JSON = JSON.stringify(
   2
 );
 
+/* ============================================================================
+ * PRESET 5: MANIM GRADIENT DESCENT OPTIMIZATION (3Blue1Brown-Style)
+ * ============================================================================ */
+
+const MANIM_GRADIENT_DESCENT_JS = String.raw`
+const loss = (w) => 0.32 * w * w + 0.35;
+
+// Coordinate system & loss parabola
+const axes = scene.add(M.Axes({
+  xRange: [-3.8, 3.8],
+  yRange: [-0.45, 4.1],
+  x: 0.5,
+  y: 0.56,
+  w: 0.80,
+  h: 0.62,
+  xLabel: "w",
+  yLabel: "L(w)",
+  grid: true,
+  xStep: 1,
+  yStep: 1,
+}));
+
+const curve = scene.add(M.Plot(loss, {
+  axes,
+  domain: [-3.35, 3.35],
+  color: COLORS.cyan,
+  width: 3.1,
+  fillUnder: true,
+}));
+
+// KaTeX equations at top stage header
+const lossTex = scene.add(M.MathTex("L(w) = 0.32\\,w^2 + 0.35", {
+  x: 0.27,
+  y: 0.10,
+  color: COLORS.cyan,
+  size: 16,
+  bg: true,
+}));
+
+const updateTex = scene.add(M.MathTex("w_{t+1} = w_t - \\eta \\nabla L(w_t)", {
+  x: 0.72,
+  y: 0.10,
+  color: COLORS.emeraldLight,
+  size: 16,
+  bg: true,
+}));
+
+// Glowing descent ball with persistent curve trail
+const wStart = -3.0;
+const ball = scene.add(M.Dot({
+  x: wStart,
+  y: loss(wStart),
+  axes,
+  radius: 8.5,
+  color: COLORS.emeraldLight,
+  glow: true,
+  label: "w_t",
+  labelOffset: [0, -18],
+  zIndex: 10,
+}));
+scene.tracePath(ball, COLORS.emerald);
+
+// Live downhill tangent gradient vector arrow
+const gradArrow = scene.add(M.Arrow({
+  from: [wStart, loss(wStart)],
+  to: [wStart + 0.9, loss(wStart) - 1.5],
+  axes,
+  color: COLORS.amber,
+  width: 3,
+  headSize: 11,
+  label: "-∇L",
+  zIndex: 8,
+}));
+
+// Global minimum markers
+const [minNx, minNy] = axes.toNorm(0, loss(0));
+const minDrop = scene.add(M.DashedLine({
+  from: [0, 0],
+  to: [0, loss(0)],
+  axes,
+  color: COLORS.amber,
+  width: 1.8,
+  zIndex: 4,
+}));
+
+const minRing = scene.add(M.Circle({
+  x: minNx,
+  y: minNy,
+  r: 0.032,
+  color: COLORS.amber,
+  width: 2,
+  dashed: true,
+  zIndex: 6,
+}));
+
+const minTex = scene.add(M.MathTex("w^* = 0,\\;\\; \\nabla L(w^*) = 0", {
+  x: 0.5,
+  y: 0.92,
+  color: COLORS.amber,
+  size: 15,
+  bg: true,
+  zIndex: 12,
+}));
+
+// Beat 0: Establish the convex loss surface & initial parameter
+scene.beat(
+  0,
+  "Loss Landscape",
+  "Convex objective L(w) = 0.32w² + 0.35 over weight space",
+  (tl) => {
+    scene.create(tl, axes, 0.95);
+    scene.create(tl, curve, 1.15, "-=0.35");
+    scene.write(tl, lossTex, 0.75, "-=0.55");
+    scene.create(tl, ball, 0.55, "-=0.1");
+    scene.indicate(tl, ball, 0.6);
+  }
+);
+
+// Beat 1: Compute negative gradient & take proportional downhill steps
+scene.beat(
+  1,
+  "Follow Negative Gradient",
+  "Step downhill along -∇L: larger slopes drive larger parameter updates",
+  (tl) => {
+    scene.write(tl, updateTex, 0.75);
+    scene.create(tl, gradArrow, 0.55, "-=0.25");
+    scene.indicate(tl, gradArrow, 0.55);
+    scene.moveAlongCurve(tl, ball, axes, loss, -3.0, -1.6, 1.35, {
+      tangentArrow: gradArrow,
+      ease: "power2.inOut",
+    });
+    scene.wait(tl, 0.2);
+    scene.moveAlongCurve(tl, ball, axes, loss, -1.6, -0.72, 1.05, {
+      tangentArrow: gradArrow,
+      ease: "power2.inOut",
+    });
+  }
+);
+
+// Beat 2: Gradient vanishes as parameters converge to global optimum
+scene.beat(
+  2,
+  "Converge to Global Minimum",
+  "Slope flattens (∇L → 0) and weights settle at the optimal minimum w*",
+  (tl) => {
+    scene.moveAlongCurve(tl, ball, axes, loss, -0.72, 0.0, 1.3, {
+      tangentArrow: gradArrow,
+      ease: "power3.out",
+    });
+    scene.fadeOut(tl, gradArrow, 0.35, "-=0.25");
+    scene.create(tl, minDrop, 0.45, "-=0.15");
+    scene.create(tl, minRing, 0.55, "-=0.25");
+    scene.write(tl, minTex, 0.65, "-=0.25");
+    scene.indicate(tl, ball, 0.8);
+    scene.indicate(tl, minRing, 0.75, "-=0.6");
+  }
+);
+`.trim();
+
+/* ============================================================================
+ * PRESET 6: MANIM NEURAL NETWORK FORWARD PASS (3Blue1Brown-Style)
+ * ============================================================================ */
+
+const MANIM_NEURAL_NET_JS = String.raw`
+// Header KaTeX layer equation
+const eq = scene.add(M.MathTex("a^{(l)} = \\sigma\\!\\left(W a^{(l-1)} + b\\right)", {
+  x: 0.5,
+  y: 0.10,
+  color: COLORS.white,
+  size: 18,
+  bg: true,
+  zIndex: 12,
+}));
+
+// Subtle column labels
+const colIn = scene.add(M.Text("INPUT", { x: 0.12, y: 0.22, size: 10.5, color: COLORS.cyan, weight: "700" }));
+const colHid = scene.add(M.Text("HIDDEN", { x: 0.35, y: 0.22, size: 10.5, color: COLORS.purple, weight: "700" }));
+const colOut = scene.add(M.Text("OUTPUT", { x: 0.57, y: 0.22, size: 10.5, color: COLORS.emeraldLight, weight: "700" }));
+
+// Layer 1: Input nodes (x1, x2)
+const x1 = scene.add(M.Node({ x: 0.12, y: 0.42, r: 0.056, label: "x₁", sublabel: "0.84", color: COLORS.cyan, zIndex: 6 }));
+const x2 = scene.add(M.Node({ x: 0.12, y: 0.68, r: 0.056, label: "x₂", sublabel: "0.31", color: COLORS.cyan, zIndex: 6 }));
+
+// Layer 2: Hidden nodes (h1, h2, h3)
+const h1 = scene.add(M.Node({ x: 0.35, y: 0.33, r: 0.055, label: "h₁", sublabel: "0.91", color: COLORS.purple, zIndex: 6 }));
+const h2 = scene.add(M.Node({ x: 0.35, y: 0.55, r: 0.055, label: "h₂", sublabel: "0.48", color: COLORS.purple, zIndex: 6 }));
+const h3 = scene.add(M.Node({ x: 0.35, y: 0.77, r: 0.055, label: "h₃", sublabel: "0.79", color: COLORS.purple, zIndex: 6 }));
+
+// Layer 3: Output node (y)
+const yNode = scene.add(M.Node({ x: 0.57, y: 0.55, r: 0.064, label: "y", sublabel: "0.94", color: COLORS.emerald, zIndex: 6 }));
+
+// Weighted synaptic edges: Input -> Hidden
+const inHiddenEdges = [
+  scene.add(M.Edge({ from: x1, to: h1, color: "rgba(56,189,248,0.42)", width: 1.8, curved: -0.06, zIndex: 2 })),
+  scene.add(M.Edge({ from: x1, to: h2, color: "rgba(56,189,248,0.34)", width: 1.5, zIndex: 2 })),
+  scene.add(M.Edge({ from: x1, to: h3, color: "rgba(56,189,248,0.28)", width: 1.4, zIndex: 2 })),
+  scene.add(M.Edge({ from: x2, to: h1, color: "rgba(168,85,247,0.30)", width: 1.4, zIndex: 2 })),
+  scene.add(M.Edge({ from: x2, to: h2, color: "rgba(168,85,247,0.38)", width: 1.6, zIndex: 2 })),
+  scene.add(M.Edge({ from: x2, to: h3, color: "rgba(168,85,247,0.44)", width: 1.9, curved: 0.06, zIndex: 2 })),
+];
+
+// Weighted synaptic edges: Hidden -> Output
+const hiddenOutEdges = [
+  scene.add(M.Edge({ from: h1, to: yNode, color: "rgba(52,211,153,0.48)", width: 2.1, curved: 0.08, zIndex: 2 })),
+  scene.add(M.Edge({ from: h2, to: yNode, color: "rgba(52,211,153,0.36)", width: 1.6, zIndex: 2 })),
+  scene.add(M.Edge({ from: h3, to: yNode, color: "rgba(52,211,153,0.46)", width: 2.0, curved: -0.08, zIndex: 2 })),
+];
+
+// Right-side confidence BarChart
+const confChart = scene.add(M.BarChart({
+  x: 0.825,
+  y: 0.55,
+  w: 0.27,
+  h: 0.50,
+  title: "CONFIDENCE",
+  labels: ["Cat", "Dog", "Fox"],
+  values: [94, 4, 2],
+  maxVal: 100,
+  unit: "%",
+  colors: [COLORS.emerald, COLORS.cyan, COLORS.purple],
+  zIndex: 5,
+}));
+
+// Bottom output summary formula
+const outTex = scene.add(M.MathTex("\\hat{y} = \\sigma(z^{(2)}) = 0.94", {
+  x: 0.35,
+  y: 0.91,
+  color: COLORS.emeraldLight,
+  size: 15,
+  bg: true,
+  zIndex: 12,
+}));
+
+// Beat 0: Build 3-layer network architecture & encode inputs
+scene.beat(
+  0,
+  "Network Topology & Inputs",
+  "Encode input vector [x₁, x₂] across weighted connections",
+  (tl) => {
+    scene.write(tl, eq, 0.75);
+    scene.fadeIn(tl, colIn, 0.35, "-=0.35");
+    scene.fadeIn(tl, colHid, 0.35, "-=0.25");
+    scene.fadeIn(tl, colOut, 0.35, "-=0.25");
+
+    scene.create(tl, x1, 0.45, "-=0.15");
+    scene.create(tl, x2, 0.45, "-=0.3");
+    scene.create(tl, h1, 0.45, "-=0.25");
+    scene.create(tl, h2, 0.45, "-=0.3");
+    scene.create(tl, h3, 0.45, "-=0.3");
+    scene.create(tl, yNode, 0.5, "-=0.25");
+
+    inHiddenEdges.forEach((e, i) => {
+      scene.create(tl, e, 0.45, i === 0 ? "-=0.2" : "-=0.38");
+    });
+    hiddenOutEdges.forEach((e, i) => {
+      scene.create(tl, e, 0.45, i === 0 ? "-=0.25" : "-=0.36");
+    });
+
+    scene.indicate(tl, x1, 0.5);
+    scene.indicate(tl, x2, 0.5, "-=0.35");
+  }
+);
+
+// Beat 1: Fire weighted signals to hidden layer & trigger activations
+scene.beat(
+  1,
+  "Hidden Layer Activation",
+  "Signals propagate through weights W⁽¹⁾ and activate nonlinear hidden neurons",
+  (tl) => {
+    inHiddenEdges.forEach((e, i) => {
+      const col = i < 3 ? COLORS.cyan : COLORS.purple;
+      scene.pulsePacket(tl, e, col, 0.85, i === 0 ? 0 : "<0.08");
+    });
+
+    scene.indicate(tl, h1, 0.65, "-=0.2");
+    scene.indicate(tl, h2, 0.65, "-=0.52");
+    scene.indicate(tl, h3, 0.65, "-=0.52");
+    scene.indicate(tl, eq, 0.6, "-=0.45");
+  }
+);
+
+// Beat 2: Propagate to output node & render class confidence bars
+scene.beat(
+  2,
+  "Output Prediction & Confidence",
+  "Hidden features combine into final output ŷ = 0.94 with rising confidence bars",
+  (tl) => {
+    hiddenOutEdges.forEach((e, i) => {
+      scene.pulsePacket(tl, e, COLORS.emeraldLight, 0.8, i === 0 ? 0 : "<0.1");
+    });
+
+    scene.indicate(tl, yNode, 0.75, "-=0.18");
+    scene.create(tl, confChart, 1.05, "-=0.35");
+    scene.write(tl, outTex, 0.65, "-=0.5");
+    scene.indicate(tl, yNode, 0.7);
+  }
+);
+`.trim();
+
 /**
  * Curated HeyClicky-grade interactive Live Visualization Showcase presets.
  */
 export const VIZ_PRESETS: Record<string, OverlayVizEvent> = {
+  manim_gradient_descent: {
+    id: "preset-manim-gradient-descent",
+    kind: "anim",
+    title: "Manim: Gradient Descent Optimization",
+    code: MANIM_GRADIENT_DESCENT_JS,
+    width: 640,
+    height: 460,
+  },
+  manim_neural_net: {
+    id: "preset-manim-neural-net",
+    kind: "anim",
+    title: "Manim: Neural Network Forward Pass",
+    code: MANIM_NEURAL_NET_JS,
+    width: 640,
+    height: 460,
+  },
   spring_vs_easing: {
     id: "preset-spring-vs-easing",
     kind: "html",
