@@ -215,6 +215,11 @@ const mockLocalModels: LocalModelDownload[] = [
   },
 ];
 
+const mockAudioSelection: { input: string | null; output: string | null } = {
+  input: null,
+  output: null,
+};
+
 /**
  * Invoke a Rust backend command safely with automatic browser fallbacks
  */
@@ -271,6 +276,28 @@ export async function invokeCommand<T>(command: string, args?: Record<string, un
       return { ok: true } as unknown as T;
     case "execute_prompt":
       return "Hello! I am your HeyClicky AI companion powered by Ollama." as unknown as T;
+    case "list_audio_devices":
+      return {
+        inputs: [
+          { name: "Microphone Array (Realtek Audio)", is_default: true },
+          { name: "USB Condenser Mic (HyperX SoloCast)", is_default: false },
+        ],
+        outputs: [
+          { name: "Speakers (Realtek High Definition Audio)", is_default: true },
+          { name: "Headphones (Sony WH-1000XM5 Stereo)", is_default: false },
+        ],
+        selected_input: mockAudioSelection.input,
+        selected_output: mockAudioSelection.output,
+      } as unknown as T;
+    case "set_audio_devices":
+      if (args) {
+        mockAudioSelection.input = (args.inputDevice as string | null) ?? null;
+        mockAudioSelection.output = (args.outputDevice as string | null) ?? null;
+      }
+      return undefined as unknown as T;
+    case "test_tts_output":
+      await new Promise((res) => setTimeout(res, 120));
+      return 94 as unknown as T;
     default:
       return {} as unknown as T;
   }

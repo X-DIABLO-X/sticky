@@ -424,3 +424,74 @@ pub async fn download_local_model(
 
     crate::ai::local_runner::download_model_weights(&target, &app_handle).await
 }
+
+// ── Audio Device Routing & Speaker Test ──
+
+#[tauri::command]
+pub async fn list_audio_devices(state: State<'_, AppState>) -> Result<serde_json::Value> {
+    let inputs = crate::audio::io::list_input_devices();
+    let outputs = crate::audio::io::list_output_devices();
+    let cfg = state.config.read().await;
+    Ok(serde_json::json!({
+        "inputs": inputs,
+        "outputs": outputs,
+        "selected_input": cfg.input_device_name,
+        "selected_output": cfg.output_device_name,
+    }))
+}
+
+#[tauri::command]
+pub async fn set_audio_devices(
+    input_device: Option<String>,
+    output_device: Option<String>,
+    #[allow(non_snake_case)] inputDevice: Option<String>,
+    #[allow(non_snake_case)] outputDevice: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<()> {
+    let normalize = |raw: Option<String>| -> Option<String> {
+        raw.and_then(|s| {
+            let trimmed = s.trim();
+            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("default") {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+    };
+
+    let selected_input = normalize(input_device.or(inputDevice));
+    let selected_output = normalize(output_device.or(outputDevice));
+
+    {
+        let mut cfg = state.config.write().await;
+        cfg.input_device_name = selected_input.clone();
+        cfg.output_device_name = selected_output.clone();
+        cfg.save()?;
+    }
+
+    {
+        let mut engine = state.audio_engine.lock().await;
+        engine.set_input_device(selected_input);
+        engine.set_output_device(selected_output).await?;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn test_tts_output(
+    text: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<u64> {
+    let phrase = text
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "Audio output and realtime voice are synced and ready.".to_string());
+
+    let started = std::time::Instant::now();
+    {
+        let mut engine = state.audio_engine.lock().await;
+        engine.test_tts_direct(&phrase).await?;
+    }
+    Ok(started.elapsed().as_millis() as u64)
+}

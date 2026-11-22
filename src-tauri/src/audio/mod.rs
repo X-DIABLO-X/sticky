@@ -19,6 +19,17 @@ use crate::error::Result;
 const TARGET_SAMPLE_RATE: u32 = 16000;
 const CHUNK_30MS: usize = 480; // 30ms @ 16kHz mono
 
+fn normalize_device_name(device_name: Option<String>) -> Option<String> {
+    device_name.and_then(|raw| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("default") {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
 pub struct AudioEngine {
     ring_consumer: Option<AudioRingConsumer>,
     input_handle: Option<AudioInputHandle>,
@@ -30,6 +41,8 @@ pub struct AudioEngine {
     pub is_listening: bool,
     recorded_buffer: Vec<f32>,
     pub mic_sample_rate: u32,
+    selected_input_device: Option<String>,
+    selected_output_device: Option<String>,
 }
 
 impl AudioEngine {
@@ -51,6 +64,8 @@ impl AudioEngine {
             is_listening: false,
             recorded_buffer: Vec::with_capacity(TARGET_SAMPLE_RATE as usize * 30), // 30 sec buffer
             mic_sample_rate: TARGET_SAMPLE_RATE,
+            selected_input_device: None,
+            selected_output_device: None,
         }
     }
 
@@ -58,11 +73,69 @@ impl AudioEngine {
         self.stt.set_groq_api_key(key);
     }
 
+    pub fn set_input_device(&mut self, device_name: Option<String>) {
+        let normalized = normalize_device_name(device_name);
+        let changed = self.selected_input_device != normalized;
+        self.selected_input_device = normalized;
+
+        if changed && self.is_listening {
+            if let Some(ref handle) = self.input_handle {
+                handle
+                    .is_running
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.drain_remaining_frames();
+            self.input_handle = None;
+            self.ring_consumer = None;
+
+            let (producer, consumer) = create_audio_ring_buffer(131072);
+            match create_input_stream(producer, self.selected_input_device.as_deref()) {
+                Ok(input_handle) => {
+                    self.mic_sample_rate = input_handle.sample_rate;
+                    self.ring_consumer = Some(consumer);
+                    self.input_handle = Some(input_handle);
+                }
+                Err(e) => {
+                    eprintln!("[Audio] Failed to switch active mic stream: {e}");
+                    self.is_listening = false;
+                }
+            }
+        }
+    }
+
+    pub fn configure_output_device(&mut self, device_name: Option<String>) {
+        self.selected_output_device = normalize_device_name(device_name);
+    }
+
     pub async fn init_output(&mut self) -> Result<()> {
-        let out = create_output_stream()?;
+        let out = create_output_stream(self.selected_output_device.as_deref())?;
         let mut guard = self.output_handle.lock().await;
-        *guard = Some(out);
+        if let Some(old) = guard.replace(out) {
+            old.shutdown();
+        }
         Ok(())
+    }
+
+    pub async fn set_output_device(&mut self, device_name: Option<String>) -> Result<()> {
+        self.selected_output_device = normalize_device_name(device_name);
+        let mut guard = self.output_handle.lock().await;
+        if let Some(old) = guard.take() {
+            old.shutdown();
+        }
+        let new_out = create_output_stream(self.selected_output_device.as_deref())?;
+        *guard = Some(new_out);
+        Ok(())
+    }
+
+    pub async fn test_tts_direct(&mut self, text: &str) -> Result<()> {
+        {
+            let mut guard = self.output_handle.lock().await;
+            if guard.is_none() {
+                let out = create_output_stream(self.selected_output_device.as_deref())?;
+                *guard = Some(out);
+            }
+        }
+        self.tts.synthesize_and_play(text).await
     }
 
     pub fn start_mic(&mut self) -> Result<()> {
@@ -77,7 +150,7 @@ impl AudioEngine {
         let (producer, consumer) = create_audio_ring_buffer(131072);
         self.ring_consumer = Some(consumer);
 
-        let input_handle = create_input_stream(producer)?;
+        let input_handle = create_input_stream(producer, self.selected_input_device.as_deref())?;
         self.mic_sample_rate = input_handle.sample_rate;
         self.input_handle = Some(input_handle);
         self.is_listening = true;

@@ -25,6 +25,23 @@ export const ModelSettings: React.FC<ModelSettingsProps> = ({
   const [showKeys, setShowKeys] = useState<Record<string, boolean>>({});
   const [testResult, setTestResult] = useState<string | null>(null);
 
+  // Sync local form state when config loads/updates asynchronously from Rust backend
+  useEffect(() => {
+    setMode(config.mode);
+  }, [config.mode]);
+
+  useEffect(() => {
+    setGroqKey(config.apiKeys.groq || "");
+  }, [config.apiKeys.groq]);
+
+  useEffect(() => {
+    setGeminiKey(config.apiKeys.gemini || "");
+  }, [config.apiKeys.gemini]);
+
+  useEffect(() => {
+    setOpenRouterKey(config.apiKeys.openrouter || "");
+  }, [config.apiKeys.openrouter]);
+
   // Ollama integration state
   const [ollamaStatus, setOllamaStatus] = useState<OllamaStatus>({
     running: false,

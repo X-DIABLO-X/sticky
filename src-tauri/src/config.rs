@@ -58,6 +58,10 @@ pub struct AppConfig {
     pub db_path: PathBuf,
     #[serde(default)]
     pub mcp_servers: Vec<McpServerDto>,
+    #[serde(default)]
+    pub input_device_name: Option<String>,
+    #[serde(default)]
+    pub output_device_name: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -79,6 +83,8 @@ impl Default for AppConfig {
             db_path: base_dir.join("data.db"),
             home_dir: base_dir,
             mcp_servers: Vec::new(),
+            input_device_name: None,
+            output_device_name: None,
         }
     }
 }

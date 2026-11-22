@@ -134,6 +134,8 @@ pub fn run() {
 
             // Initialize Audio Engine + Rodio output thread
             let mut audio_engine = AudioEngine::new(config.groq_api_key.clone());
+            audio_engine.set_input_device(config.input_device_name.clone());
+            audio_engine.configure_output_device(config.output_device_name.clone());
             if let Err(e) = tauri::async_runtime::block_on(audio_engine.init_output()) {
                 eprintln!("[Sticky] Audio output init warning: {e}");
             }
@@ -285,6 +287,9 @@ pub fn run() {
             commands::get_hardware_profile,
             commands::get_local_models,
             commands::download_local_model,
+            commands::list_audio_devices,
+            commands::set_audio_devices,
+            commands::test_tts_output,
         ])
         .build(tauri::generate_context!());
 

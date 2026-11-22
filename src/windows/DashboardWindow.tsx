@@ -27,6 +27,7 @@ import {
 } from "../components/ui/primitives";
 import { AgentList } from "../components/agents/AgentList";
 import { CronManager } from "../components/agents/CronManager";
+import { AudioSettings } from "../components/settings/AudioSettings";
 import { ModelSettings } from "../components/settings/ModelSettings";
 import { HotkeySettings } from "../components/settings/HotkeySettings";
 import { McpSettings } from "../components/settings/McpSettings";
@@ -498,6 +499,7 @@ export const DashboardWindow: React.FC = () => {
             </TabsContent>
 
             <TabsContent value="settings" className="space-y-6 outline-none">
+              <AudioSettings />
               <ModelSettings
                 config={config}
                 hardware={hardwareProfile}
