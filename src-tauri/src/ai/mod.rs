@@ -1,3 +1,4 @@
+pub mod intent;
 pub mod local_runner;
 pub mod prompts;
 pub mod providers;

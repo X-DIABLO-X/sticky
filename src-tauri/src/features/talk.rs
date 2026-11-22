@@ -15,6 +15,7 @@ use crate::audio::AudioEngine;
 use crate::config::AppConfig;
 use crate::error::Result;
 use crate::screen::a11y::get_focused_window_tree;
+use crate::ai::intent::{classify_query, is_screen_referential, QueryIntent};
 use crate::screen::capture::{CapturedScreen, DetectedElement, ScreenCaptureService};
 use crate::screen::ContextPrewarmer;
 use crate::ui::windows::WindowManager;
@@ -439,6 +440,28 @@ fn split_tag_segments(text: &str) -> Vec<&str> {
     parts
 }
 
+async fn llm_intent(router: std::sync::Arc<ModelRouter>, query: String) -> Option<QueryIntent> {
+    let messages = vec![
+        ChatMessage::system(crate::ai::intent::llm_classifier_system_prompt()),
+        ChatMessage::user(query),
+    ];
+    let mut rx = router.route_and_stream(TaskType::FastTalk, &messages, &[]).await.ok()?;
+    let mut out = String::new();
+    let fut = async {
+        while let Some(chunk) = rx.recv().await {
+            if let Some(d) = chunk.ok()?.delta_text {
+                out.push_str(&d);
+                if out.len() > 40 {
+                    break;
+                }
+            }
+        }
+        Some(())
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(5), fut).await;
+    crate::ai::intent::parse_llm_label(&out)
+}
+
 async fn capture_vlm_context() -> (Option<CapturedScreen>, Vec<DetectedElement>, String) {
     let a11y = tauri::async_runtime::spawn_blocking(|| get_focused_window_tree(5))
         .await
@@ -647,14 +670,14 @@ impl TalkController {
                 let trailing_hit = !is_ptt_held
                     && speech_detected
                     && silence_start
-                        .map(|s| s.elapsed() >= Duration::from_millis(2200))
+                        .map(|s| s.elapsed() >= Duration::from_millis(800))
                         .unwrap_or(false);
                 let initial_hit = !is_ptt_held && !speech_detected && elapsed >= Duration::from_millis(8000);
                 let max_hit = elapsed >= Duration::from_millis(60000);
 
                 if trailing_hit || initial_hit || max_hit {
                     if trailing_hit {
-                        emit_activity_log(&app_handle_clone, "talk", "Speech Ended", "2.2s silence detected; transcribing audio...");
+                        emit_activity_log(&app_handle_clone, "talk", "Speech Ended", "0.8s silence detected; transcribing audio...");
                     } else if initial_hit {
                         emit_activity_log(&app_handle_clone, "talk", "Silence Timeout", "No speech detected within 8 seconds.");
                     } else if max_hit {
@@ -747,8 +770,27 @@ impl TalkController {
             emit_activity_log(&self.app_handle, "llm", "Prompting AI Model", "Routing transcript with active screen & UI context...");
         }
 
-        // Capture fresh grounded VLM screenshot + Set-of-Mark detected elements (OCR + A11y)
-        let (screen, elements, window_title) = capture_vlm_context().await;
+        // Mic is no longer needed once we have the transcript.
+        self.audio_engine.lock().await.release_mic().await;
+
+        // Intent classification: heuristic first, tiny LLM call only when unsure.
+        let router_for_intent = self.router.clone();
+        let intent = classify_query(&transcript, || llm_intent(router_for_intent, transcript.clone())).await;
+        let screen_ref = is_screen_referential(&transcript);
+        eprintln!("[talk] intent={} screen_ref={} query={:?}", intent.as_str(), screen_ref, transcript);
+        emit_activity_log(&self.app_handle, "llm", "Intent Classified", intent.as_str());
+        let _ = self.app_handle.emit("talk:intent", serde_json::json!({ "intent": intent.as_str() }));
+        if self.talk_session_id.load(Ordering::SeqCst) != my_session {
+            return Ok(());
+        }
+
+        // INSTRUCT needs the grounded screenshot + SoM elements. EXPLAIN/CHAT skip the heavy
+        // OCR/A11y grounding unless the question refers to what's on screen.
+        let (screen, elements, window_title) = if intent == QueryIntent::Instruct || screen_ref {
+            capture_vlm_context().await
+        } else {
+            (None, Vec::new(), String::new())
+        };
         if self.talk_session_id.load(Ordering::SeqCst) != my_session {
             return Ok(());
         }
@@ -772,7 +814,7 @@ impl TalkController {
         };
 
         let messages = vec![
-            ChatMessage::system(Prompts::talk_mode_system_prompt()),
+            ChatMessage::system(Prompts::talk_mode_system_prompt_for(intent)),
             chat_message,
         ];
 
@@ -1291,7 +1333,9 @@ impl TalkController {
             ChatMessage::user(verify_prompt)
         };
 
-        let mut messages = vec![ChatMessage::system(Prompts::talk_mode_system_prompt())];
+        let mut messages = vec![ChatMessage::system(Prompts::talk_mode_system_prompt_for(
+            QueryIntent::Instruct,
+        ))];
         {
             let history = self.guide_history.lock().await;
             let start = history.len().saturating_sub(10);

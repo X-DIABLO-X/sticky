@@ -178,13 +178,26 @@ impl AudioEngine {
     }
 
     pub fn stop_mic(&mut self) {
-        if let Some(ref handle) = self.input_handle {
+        if let Some(handle) = self.input_handle.take() {
             handle.is_running.store(false, std::sync::atomic::Ordering::SeqCst);
+            // Pause first so WASAPI capture stops immediately, then drop to release the device.
+            let _ = cpal::traits::StreamTrait::pause(&handle.stream);
+            drop(handle);
         }
         self.drain_remaining_frames();
-        self.input_handle = None;
         self.ring_consumer = None;
         self.is_listening = false;
+        self.vad.reset();
+    }
+
+    /// Hard-release the microphone device. Idempotent; call before TTS playback.
+    /// Returns once the input stream has been dropped (synchronous, ~ms).
+    pub async fn release_mic(&mut self) {
+        self.stop_mic();
+    }
+
+    pub fn is_mic_released(&self) -> bool {
+        self.input_handle.is_none()
     }
 
     pub fn stop_listening(&mut self) {

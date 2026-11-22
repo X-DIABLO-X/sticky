@@ -8,6 +8,12 @@ import sys
 import wave
 from typing import Optional, Tuple
 
+DEFAULT_KOKORO_VOICE = os.environ.get("STICKY_KOKORO_VOICE", "af_heart")
+try:
+    DEFAULT_KOKORO_SPEED = float(os.environ.get("STICKY_KOKORO_SPEED", "1.0"))
+except ValueError:
+    DEFAULT_KOKORO_SPEED = 1.0
+
 DEFAULT_EDGE_VOICE = os.environ.get("STICKY_TTS_VOICE", "en-US-AvaMultilingualNeural")
 DEFAULT_EDGE_RATE = os.environ.get("STICKY_TTS_RATE", "+10%")
 
@@ -16,6 +22,52 @@ try:
     PIPER_LENGTH_SCALE: Optional[float] = float(_raw_length_scale) if _raw_length_scale else None
 except ValueError:
     PIPER_LENGTH_SCALE = None
+
+
+def load_kokoro_pipeline():
+    """Load and warm up Kokoro-82M neural TTS pipeline using CUDA GPU or CPU."""
+    try:
+        import torch
+        from kokoro import KPipeline
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        with contextlib.redirect_stdout(sys.stderr):
+            pipeline = KPipeline(lang_code="a", device=device)
+            # Warm up pipeline with a micro-utterance
+            try:
+                for _ in pipeline("ok", voice=DEFAULT_KOKORO_VOICE):
+                    pass
+            except Exception as warm_exc:
+                print(f"[neural_tts] Kokoro warmup warning: {warm_exc}", file=sys.stderr, flush=True)
+
+        print(f"[neural_tts] Kokoro-82M loaded successfully on {device.upper()}", file=sys.stderr, flush=True)
+        return pipeline, device
+    except Exception as exc:
+        print(f"[neural_tts] Kokoro unavailable ({exc}); fallback to Piper/Edge-TTS", file=sys.stderr, flush=True)
+        return None, "none"
+
+
+def synthesize_kokoro_pcm(
+    pipeline,
+    text: str,
+    voice: str = DEFAULT_KOKORO_VOICE,
+    speed: float = DEFAULT_KOKORO_SPEED,
+) -> Tuple[bytes, int, int]:
+    """Synthesize text in-memory with Kokoro-82M into raw 24kHz mono PCM16 bytes."""
+    import numpy as np
+
+    chunks = []
+    generator = pipeline(text, voice=voice, speed=speed)
+    for gs, ps, audio in generator:
+        if audio is not None and len(audio) > 0:
+            chunks.append(audio)
+
+    if not chunks:
+        raise RuntimeError("Kokoro produced empty audio")
+
+    total_audio = np.concatenate(chunks)
+    pcm_i16 = (np.clip(total_audio, -1.0, 1.0) * 32767.0).astype("<i2", copy=False)
+    return pcm_i16.tobytes(), 24000, 1
 
 
 def find_piper_model() -> Optional[str]:
@@ -49,7 +101,6 @@ def load_piper_voice():
 
         with contextlib.redirect_stdout(sys.stderr):
             voice = PiperVoice.load(model_path)
-            # Warm up ONNX session + espeak-ng phonemizer so even utterance #1 is <120ms.
             try:
                 if hasattr(voice, "synthesize"):
                     for _ in voice.synthesize("ok"):
@@ -178,19 +229,26 @@ def _write_protocol_response(out_buf, header: dict, pcm_bytes: bytes = b"") -> N
 def run_daemon() -> None:
     """Persistent warm stdio TTS daemon.
 
-    Startup: writes `READY piper\\n` or `READY edge\\n`.
+    Startup: writes `READY kokoro\\n` or `READY piper\\n` or `READY edge\\n`.
     Request (JSON line on stdin): `{"text": "...", "engine": "auto"}`
-    Response (stdout): JSON header line `{"ok": true, "sample_rate": 22050, "channels": 1, "pcm_len": N, "engine": "piper"}\\n`
+    Response (stdout): JSON header line `{"ok": true, "sample_rate": 24000, "channels": 1, "pcm_len": N, "engine": "kokoro"}\\n`
                        immediately followed by `N` raw little-endian PCM16 bytes.
     """
     proto_out = sys.stdout.buffer
     proto_in = sys.stdin.buffer
 
+    kokoro_pipeline, kokoro_device = load_kokoro_pipeline()
     piper_voice = load_piper_voice()
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    ready_engine = "piper" if piper_voice is not None else "edge"
+    if kokoro_pipeline is not None:
+        ready_engine = "kokoro"
+    elif piper_voice is not None:
+        ready_engine = "piper"
+    else:
+        ready_engine = "edge"
+
     proto_out.write(f"READY {ready_engine}\n".encode("utf-8"))
     proto_out.flush()
 
@@ -215,7 +273,7 @@ def run_daemon() -> None:
                 continue
 
             if req.get("cmd") in ("quit", "exit", "shutdown"):
-                _write_protocol_response(proto_out, {"ok": True, "sample_rate": 22050, "channels": 1, "pcm_len": 0, "engine": "none"})
+                _write_protocol_response(proto_out, {"ok": True, "sample_rate": 24000, "channels": 1, "pcm_len": 0, "engine": "none"})
                 break
 
             text = str(req.get("text", "")).strip()
@@ -226,26 +284,44 @@ def run_daemon() -> None:
             if not text:
                 _write_protocol_response(
                     proto_out,
-                    {"ok": True, "sample_rate": 22050, "channels": 1, "pcm_len": 0, "engine": "none"},
+                    {"ok": True, "sample_rate": 24000, "channels": 1, "pcm_len": 0, "engine": "none"},
                 )
                 continue
 
             pcm_bytes = b""
-            sample_rate = 22050
+            sample_rate = 24000
             channels = 1
             used_engine = ""
             last_error: Optional[str] = None
 
-            # 1. Local Piper ONNX neural voice (~60-120ms, zero network)
-            if engine in ("auto", "piper") and piper_voice is not None:
+            # 1. Kokoro-82M High-Quality Expressive Neural TTS (24kHz on CUDA GPU ~0.02 RTF)
+            if engine in ("auto", "kokoro") and kokoro_pipeline is not None:
+                try:
+                    k_voice = str(req.get("voice") or DEFAULT_KOKORO_VOICE).strip() or DEFAULT_KOKORO_VOICE
+                    try:
+                        k_speed = float(req.get("speed") or DEFAULT_KOKORO_SPEED)
+                    except ValueError:
+                        k_speed = DEFAULT_KOKORO_SPEED
+
+                    pcm_bytes, sample_rate, channels = synthesize_kokoro_pcm(
+                        kokoro_pipeline, text, voice=k_voice, speed=k_speed
+                    )
+                    used_engine = "kokoro"
+                except Exception as exc:
+                    last_error = f"Kokoro failed: {exc}"
+                    print(f"[neural_tts] {last_error}", file=sys.stderr, flush=True)
+
+            # 2. Local Piper ONNX neural voice (~60-120ms, zero network)
+            if not used_engine and engine in ("auto", "piper") and piper_voice is not None:
                 try:
                     pcm_bytes, sample_rate, channels = synthesize_piper_pcm(piper_voice, text)
                     used_engine = "piper"
                 except Exception as exc:
-                    last_error = f"Piper failed: {exc}"
-                    print(f"[neural_tts] {last_error}", file=sys.stderr, flush=True)
+                    p_err = f"Piper failed: {exc}"
+                    last_error = f"{last_error}; {p_err}" if last_error else p_err
+                    print(f"[neural_tts] {p_err}", file=sys.stderr, flush=True)
 
-            # 2. Warm Edge-TTS in-memory fallback (zero temp files)
+            # 3. Warm Edge-TTS in-memory fallback (zero temp files)
             if not used_engine and engine in ("auto", "edge"):
                 try:
                     with contextlib.redirect_stdout(sys.stderr):
@@ -302,21 +378,27 @@ def main() -> None:
     b64_text = sys.argv[1]
     out_wav = sys.argv[2]
     explicit_voice = sys.argv[3].strip() if len(sys.argv) >= 4 and sys.argv[3].strip() else ""
-    voice = explicit_voice or DEFAULT_EDGE_VOICE
 
     text = base64.b64decode(b64_text).decode("utf-8").strip()
     if not text:
         sys.exit(0)
 
     try:
-        if not explicit_voice:
-            piper_voice = load_piper_voice()
-            if piper_voice is not None:
-                pcm_bytes, sample_rate, channels = synthesize_piper_pcm(piper_voice, text)
-                write_wav_file(out_wav, pcm_bytes, sample_rate, channels)
-                return
+        kokoro_pipeline, _ = load_kokoro_pipeline()
+        if kokoro_pipeline is not None:
+            v = explicit_voice or DEFAULT_KOKORO_VOICE
+            pcm_bytes, sample_rate, channels = synthesize_kokoro_pcm(kokoro_pipeline, text, voice=v)
+            write_wav_file(out_wav, pcm_bytes, sample_rate, channels)
+            return
 
-        asyncio.run(synthesize_to_wav(text, out_wav, voice=voice))
+        piper_voice = load_piper_voice()
+        if piper_voice is not None:
+            pcm_bytes, sample_rate, channels = synthesize_piper_pcm(piper_voice, text)
+            write_wav_file(out_wav, pcm_bytes, sample_rate, channels)
+            return
+
+        v = explicit_voice or DEFAULT_EDGE_VOICE
+        asyncio.run(synthesize_to_wav(text, out_wav, voice=v))
     except Exception as exc:
         print(f"neural_tts error: {exc}", file=sys.stderr)
         sys.exit(2)

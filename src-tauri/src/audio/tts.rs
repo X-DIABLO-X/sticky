@@ -47,11 +47,11 @@ enum DaemonError {
     Synthesis(String),
 }
 
-struct SynthesizedPcm {
-    samples: Vec<f32>,
-    sample_rate: u32,
-    channels: u16,
-    engine: String,
+pub struct SynthesizedPcm {
+    pub samples: Vec<f32>,
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub engine: String,
 }
 
 struct TtsDaemon {
@@ -456,6 +456,43 @@ impl KokoroTts {
         if let Some(ref out) = *guard {
             out.stop();
         }
+    }
+
+    /// Directly synthesize via the warm daemon (or OS SAPI fallback) and return raw PCM.
+    pub async fn synthesize_direct(&self, text: &str) -> Result<SynthesizedPcm> {
+        let clean_text = Self::sanitize_for_speech(text);
+        if clean_text.is_empty() {
+            return Ok(SynthesizedPcm {
+                samples: Vec::new(),
+                sample_rate: 24000,
+                channels: 1,
+                engine: "none".into(),
+            });
+        }
+
+        let mut daemon_guard = self.daemon.lock().await;
+        if daemon_guard.is_none() {
+            match TtsDaemon::spawn().await {
+                Ok(d) => *daemon_guard = Some(d),
+                Err(e) => {
+                    eprintln!("[TTS] Failed to spawn daemon: {e}");
+                    return Err(e);
+                }
+            }
+        }
+
+        if let Some(ref mut daemon) = *daemon_guard {
+            match daemon.synthesize(&clean_text).await {
+                Ok(pcm) => return Ok(pcm),
+                Err(DaemonError::Synthesis(err)) => return Err(AppError::Audio(err)),
+                Err(DaemonError::Transport(err)) => {
+                    eprintln!("[TTS] Daemon transport error: {err}; restarting...");
+                    daemon_guard.take();
+                }
+            }
+        }
+
+        Err(AppError::Audio("TTS synthesis unavailable".into()))
     }
 
     /// Directly synthesize via the warm daemon (or OS SAPI fallback) and play on `output_handle`.
