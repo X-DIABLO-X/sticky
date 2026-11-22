@@ -556,20 +556,12 @@ export const OverlayWindow: React.FC = () => {
         </div>
       )}
 
-      {/* Developer Sandbox & Live Showcase Bar (Toggle with Ctrl+Shift+O) */}
-      <div
-        ref={devControlsRef}
-        className="fixed bottom-3 right-3 z-50 pointer-events-auto"
-      >
-        {!showDevControls ? (
-          <button
-            onClick={() => setShowDevControls(true)}
-            className="p-2 rounded-full bg-zinc-950/85 border border-emerald-400/30 hover:border-emerald-400 text-zinc-400 hover:text-emerald-300 shadow-xl backdrop-blur-md transition-all"
-            title="Open Spatial Overlay Sandbox (Ctrl+Shift+O)"
-          >
-            <Sparkles className="w-3.5 h-3.5" />
-          </button>
-        ) : (
+      {/* Hidden Developer Sandbox Bar (Only visible when explicitly toggled via Ctrl+Shift+O — zero idle bottom-right icon) */}
+      {showDevControls && (
+        <div
+          ref={devControlsRef}
+          className="fixed bottom-3 right-3 z-50 pointer-events-auto"
+        >
           <div className="flex flex-wrap items-center gap-1.5 p-2 rounded-2xl bg-zinc-950/[0.92] border border-emerald-400/40 shadow-[0_14px_40px_rgba(0,0,0,0.75)] backdrop-blur-xl text-xs">
             <span className="text-[10px] font-bold text-emerald-400 uppercase tracking-wider px-1.5">
               Showcase
@@ -655,13 +647,13 @@ export const OverlayWindow: React.FC = () => {
             <button
               onClick={() => setShowDevControls(false)}
               className="text-zinc-400 hover:text-white px-1.5 py-0.5 rounded hover:bg-white/10 transition-colors"
-              title="Collapse Sandbox"
+              title="Close Sandbox"
             >
               ✕
             </button>
           </div>
-        )}
-      </div>
+        </div>
+      )}
     </div>
   );
 };
