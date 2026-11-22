@@ -1,8 +1,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::ai::local_runner::{HardwareProfileDto, LocalModelSpec};
+use crate::ai::providers::openai_codex::{
+    CodexAuthStatus, OpenAiCodexProvider, DEFAULT_CODEX_MODEL,
+};
+use crate::ai::providers::{ChatMessage, LlmProvider};
 use crate::ai::router::TaskType;
 use crate::ai::AgentRuntime;
 use crate::config::{AppConfig, McpServerDto};
@@ -494,4 +498,139 @@ pub async fn test_tts_output(
         engine.test_tts_direct(&phrase).await?;
     }
     Ok(started.elapsed().as_millis() as u64)
+}
+
+// ── ChatGPT Codex OAuth & LLM Settings ──
+
+#[tauri::command]
+pub async fn codex_auth_status(state: State<'_, AppState>) -> Result<CodexAuthStatus> {
+    let cfg = state.config.read().await;
+    Ok(OpenAiCodexProvider::get_status(
+        &cfg.codex_model_name,
+        cfg.use_chatgpt_codex_only,
+    ))
+}
+
+#[tauri::command]
+pub async fn start_codex_oauth_login(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<CodexAuthStatus> {
+    let (model, codex_only) = {
+        let cfg = state.config.read().await;
+        (cfg.codex_model_name.clone(), cfg.use_chatgpt_codex_only)
+    };
+    let status = OpenAiCodexProvider::start_oauth_login(&model, codex_only).await?;
+    let _ = Emitter::emit(&app, "codex:auth_changed", &status);
+    Ok(status)
+}
+
+#[tauri::command]
+pub async fn logout_codex_auth(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<CodexAuthStatus> {
+    OpenAiCodexProvider::logout()?;
+    let (model, codex_only) = {
+        let cfg = state.config.read().await;
+        (cfg.codex_model_name.clone(), cfg.use_chatgpt_codex_only)
+    };
+    let status = OpenAiCodexProvider::get_status(&model, codex_only);
+    let _ = Emitter::emit(&app, "codex:auth_changed", &status);
+    Ok(status)
+}
+
+#[tauri::command]
+pub async fn import_codex_cli_auth(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<CodexAuthStatus> {
+    let (model, codex_only) = {
+        let cfg = state.config.read().await;
+        (cfg.codex_model_name.clone(), cfg.use_chatgpt_codex_only)
+    };
+    let status = OpenAiCodexProvider::import_from_codex_cli(&model, codex_only)?;
+    let _ = Emitter::emit(&app, "codex:auth_changed", &status);
+    Ok(status)
+}
+
+#[tauri::command]
+pub async fn set_codex_settings(
+    model: Option<String>,
+    codex_only: Option<bool>,
+    #[allow(non_snake_case)] codexOnly: Option<bool>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<CodexAuthStatus> {
+    let (resolved_model, resolved_codex_only) = {
+        let mut cfg = state.config.write().await;
+        if let Some(m) = model {
+            let trimmed = m.trim();
+            if !trimmed.is_empty() {
+                cfg.codex_model_name = trimmed.to_string();
+            }
+        }
+        if let Some(only) = codex_only.or(codexOnly) {
+            cfg.use_chatgpt_codex_only = only;
+        }
+        cfg.save()?;
+        (cfg.codex_model_name.clone(), cfg.use_chatgpt_codex_only)
+    };
+
+    let status = OpenAiCodexProvider::get_status(&resolved_model, resolved_codex_only);
+    let _ = Emitter::emit(&app, "codex:auth_changed", &status);
+    Ok(status)
+}
+
+#[tauri::command]
+pub async fn test_codex_llm(
+    prompt: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value> {
+    if !OpenAiCodexProvider::is_authenticated() {
+        return Err(AppError::Ai(
+            "Not signed in to ChatGPT Codex. Click 'Sign in with ChatGPT' in Settings first."
+                .to_string(),
+        ));
+    }
+
+    let model = {
+        let cfg = state.config.read().await;
+        let trimmed = cfg.codex_model_name.trim();
+        if trimmed.is_empty() {
+            DEFAULT_CODEX_MODEL.to_string()
+        } else {
+            trimmed.to_string()
+        }
+    };
+
+    let p = prompt
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            "Reply with a short friendly hello confirming you are online.".to_string()
+        });
+
+    let messages = vec![
+        ChatMessage::system("You are Sticky, a concise helpful AI assistant."),
+        ChatMessage::user(p),
+    ];
+
+    let started = std::time::Instant::now();
+    let provider = OpenAiCodexProvider::new();
+    let mut rx = LlmProvider::stream_chat(&provider, &model, &messages, &[]).await?;
+    let mut reply = String::new();
+    while let Some(chunk_res) = rx.recv().await {
+        let chunk = chunk_res?;
+        if let Some(delta) = chunk.delta_text {
+            reply.push_str(&delta);
+        }
+    }
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+
+    Ok(serde_json::json!({
+        "model": model,
+        "reply": reply.trim().to_string(),
+        "latency_ms": elapsed_ms,
+    }))
 }

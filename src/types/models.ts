@@ -44,6 +44,16 @@ export interface OllamaStatus {
   current_model: string;
 }
 
+export interface CodexAuthStatus {
+  authenticated: boolean;
+  email?: string | null;
+  account_id?: string | null;
+  expires_at?: number | null;
+  auth_path: string;
+  model: string;
+  codex_only: boolean;
+}
+
 export interface AppConfig {
   mode: 'local' | 'hybrid' | 'cloud';
   hotkeys: AppHotkeys;
@@ -55,6 +65,8 @@ export interface AppConfig {
   selectedLocalModel: string;
   local_llama_url?: string;
   local_model_name?: string;
+  codex_model_name?: string;
+  use_chatgpt_codex_only?: boolean;
 }
 
 export interface Agent {

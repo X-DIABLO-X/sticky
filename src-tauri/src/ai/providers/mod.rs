@@ -1,6 +1,7 @@
 pub mod gemini;
 pub mod groq;
 pub mod local_llamacpp;
+pub mod openai_codex;
 pub mod openrouter;
 
 use async_trait::async_trait;

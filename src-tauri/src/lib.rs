@@ -290,6 +290,12 @@ pub fn run() {
             commands::list_audio_devices,
             commands::set_audio_devices,
             commands::test_tts_output,
+            commands::codex_auth_status,
+            commands::start_codex_oauth_login,
+            commands::logout_codex_auth,
+            commands::import_codex_cli_auth,
+            commands::set_codex_settings,
+            commands::test_codex_llm,
         ])
         .build(tauri::generate_context!());
 

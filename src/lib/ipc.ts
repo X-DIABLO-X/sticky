@@ -6,7 +6,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, emit, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import type { AppConfig, HardwareProfile, Agent, CronJob, Memory, LocalModelDownload, McpServerConfig, OllamaStatus } from "../types/models";
+import type { AppConfig, CodexAuthStatus, HardwareProfile, Agent, CronJob, Memory, LocalModelDownload, McpServerConfig, OllamaStatus } from "../types/models";
 import type { ToolConfirmationPayload } from "../types/tools";
 
 export function isTauri(): boolean {
@@ -63,6 +63,8 @@ const mockConfig: AppConfig = {
   soundEnabled: true,
   autoAdvanceWalkthrough: true,
   selectedLocalModel: "bonsai-2:9b",
+  codex_model_name: "gpt-6-luna",
+  use_chatgpt_codex_only: true,
   mcpServers: [
     {
       id: "mcp-fs",
@@ -220,6 +222,16 @@ const mockAudioSelection: { input: string | null; output: string | null } = {
   output: null,
 };
 
+const mockCodexAuth: CodexAuthStatus = {
+  authenticated: false,
+  email: null,
+  account_id: null,
+  expires_at: null,
+  auth_path: "~/.sticky/codex_auth.json",
+  model: "gpt-6-luna",
+  codex_only: true,
+};
+
 /**
  * Invoke a Rust backend command safely with automatic browser fallbacks
  */
@@ -298,6 +310,48 @@ export async function invokeCommand<T>(command: string, args?: Record<string, un
     case "test_tts_output":
       await new Promise((res) => setTimeout(res, 120));
       return 94 as unknown as T;
+    case "codex_auth_status":
+      return { ...mockCodexAuth } as unknown as T;
+    case "start_codex_oauth_login":
+      await new Promise((res) => setTimeout(res, 200));
+      mockCodexAuth.authenticated = true;
+      mockCodexAuth.email = "user@example.com";
+      mockCodexAuth.account_id = "acct_mock_codex";
+      mockCodexAuth.expires_at = Math.floor(Date.now() / 1000) + 3600;
+      mockBus.emit("codex:auth_changed", { ...mockCodexAuth });
+      return { ...mockCodexAuth } as unknown as T;
+    case "logout_codex_auth":
+      mockCodexAuth.authenticated = false;
+      mockCodexAuth.email = null;
+      mockCodexAuth.account_id = null;
+      mockCodexAuth.expires_at = null;
+      mockBus.emit("codex:auth_changed", { ...mockCodexAuth });
+      return { ...mockCodexAuth } as unknown as T;
+    case "import_codex_cli_auth":
+      mockCodexAuth.authenticated = true;
+      mockCodexAuth.email = "cli-user@example.com";
+      mockCodexAuth.account_id = "acct_mock_cli";
+      mockCodexAuth.expires_at = Math.floor(Date.now() / 1000) + 3600;
+      mockBus.emit("codex:auth_changed", { ...mockCodexAuth });
+      return { ...mockCodexAuth } as unknown as T;
+    case "set_codex_settings":
+      if (typeof args?.model === "string" && args.model.trim()) {
+        mockCodexAuth.model = args.model.trim();
+        mockConfig.codex_model_name = mockCodexAuth.model;
+      }
+      if (typeof args?.codexOnly === "boolean") {
+        mockCodexAuth.codex_only = args.codexOnly;
+        mockConfig.use_chatgpt_codex_only = mockCodexAuth.codex_only;
+      }
+      mockBus.emit("codex:auth_changed", { ...mockCodexAuth });
+      return { ...mockCodexAuth } as unknown as T;
+    case "test_codex_llm":
+      await new Promise((res) => setTimeout(res, 120));
+      return {
+        model: mockCodexAuth.model || "gpt-6-luna",
+        reply: "Sticky ChatGPT Codex connection OK.",
+        latency_ms: 142,
+      } as unknown as T;
     default:
       return {} as unknown as T;
   }
@@ -317,6 +371,32 @@ export async function checkOllamaStatus(): Promise<OllamaStatus> {
 
 export async function setActiveModel(modelName: string): Promise<void> {
   return invokeCommand<void>("set_active_model", { modelName });
+}
+
+export async function getCodexAuthStatus(): Promise<CodexAuthStatus> {
+  return invokeCommand<CodexAuthStatus>("codex_auth_status");
+}
+
+export async function startCodexOAuthLogin(): Promise<CodexAuthStatus> {
+  return invokeCommand<CodexAuthStatus>("start_codex_oauth_login");
+}
+
+export async function logoutCodexAuth(): Promise<CodexAuthStatus> {
+  return invokeCommand<CodexAuthStatus>("logout_codex_auth");
+}
+
+export async function importCodexCliAuth(): Promise<CodexAuthStatus> {
+  return invokeCommand<CodexAuthStatus>("import_codex_cli_auth");
+}
+
+export async function setCodexSettings(model?: string, codexOnly?: boolean): Promise<CodexAuthStatus> {
+  return invokeCommand<CodexAuthStatus>("set_codex_settings", { model, codexOnly });
+}
+
+export async function testCodexLlm(
+  prompt?: string
+): Promise<{ model: string; reply: string; latency_ms: number }> {
+  return invokeCommand<{ model: string; reply: string; latency_ms: number }>("test_codex_llm", { prompt });
 }
 
 /**

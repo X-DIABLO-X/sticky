@@ -3,8 +3,12 @@ use tokio::sync::mpsc::Receiver;
 use tokio::sync::RwLock;
 
 use crate::ai::providers::{
-    gemini::GeminiProvider, groq::GroqProvider, local_llamacpp::LocalLlamaProvider,
-    openrouter::OpenRouterProvider, ChatChunk, ChatMessage, LlmProvider, ToolDefinition,
+    gemini::GeminiProvider,
+    groq::GroqProvider,
+    local_llamacpp::LocalLlamaProvider,
+    openai_codex::{OpenAiCodexProvider, DEFAULT_CODEX_MODEL},
+    openrouter::OpenRouterProvider,
+    ChatChunk, ChatMessage, LlmProvider, ToolDefinition,
 };
 use crate::config::AppConfig;
 use crate::error::{AppError, Result};
@@ -38,7 +42,7 @@ impl ModelRouter {
 
         if execution_chain.is_empty() {
             return Err(AppError::Ai(
-                "No AI provider available. Start Ollama locally or add a free Groq/Gemini/OpenRouter API key in Settings.".into(),
+                "No AI provider available. Sign in with ChatGPT Codex in Settings, start Ollama locally, or add a free Groq/Gemini/OpenRouter API key in Settings.".into(),
             ));
         }
 
@@ -117,6 +121,19 @@ impl ModelRouter {
         task: TaskType,
     ) -> Vec<(Arc<dyn LlmProvider>, String)> {
         let mut chain: Vec<(Arc<dyn LlmProvider>, String)> = Vec::new();
+
+        if OpenAiCodexProvider::is_authenticated() {
+            let codex_model = if cfg.codex_model_name.trim().is_empty() {
+                DEFAULT_CODEX_MODEL.to_string()
+            } else {
+                cfg.codex_model_name.trim().to_string()
+            };
+            let codex: Arc<dyn LlmProvider> = Arc::new(OpenAiCodexProvider::new());
+            chain.push((codex, codex_model));
+            if cfg.use_chatgpt_codex_only {
+                return chain;
+            }
+        }
 
         let local = Arc::new(LocalLlamaProvider::new(cfg.local_llama_url.clone()));
         let groq = cfg

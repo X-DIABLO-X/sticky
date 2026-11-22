@@ -14,7 +14,7 @@ import {
   Terminal,
   Trash2,
 } from "lucide-react";
-import { invokeCommand, listenEvent } from "../lib/ipc";
+import { getCodexAuthStatus, invokeCommand, listenEvent } from "../lib/ipc";
 import {
   Badge,
   Button,
@@ -34,6 +34,7 @@ import { McpSettings } from "../components/settings/McpSettings";
 import { LiveLogs } from "../components/dashboard/LiveLogs";
 import type {
   AppConfig,
+  CodexAuthStatus,
   HardwareProfile as DomainHardwareProfile,
   LocalModelDownload,
   McpServerConfig,
@@ -78,6 +79,8 @@ const defaultAppConfig: AppConfig = {
   autoAdvanceWalkthrough: true,
   mcpServers: [],
   selectedLocalModel: "bonsai-2:9b",
+  codex_model_name: "gpt-6-luna",
+  use_chatgpt_codex_only: true,
 };
 
 const defaultHardware: DomainHardwareProfile = {
@@ -102,6 +105,15 @@ const defaultLocalModels: LocalModelDownload[] = [
 
 export const DashboardWindow: React.FC = () => {
   const [ollama, setOllama] = useState<OllamaStatus>({ running: false, models: [] });
+  const [codexAuth, setCodexAuth] = useState<CodexAuthStatus>({
+    authenticated: false,
+    email: null,
+    account_id: null,
+    expires_at: null,
+    auth_path: "",
+    model: "gpt-6-luna",
+    codex_only: true,
+  });
   const [hardware, setHardware] = useState<HardwareProfile | null>(null);
   const [hardwareProfile, setHardwareProfile] = useState<DomainHardwareProfile>(defaultHardware);
   const [config, setConfig] = useState<AppConfig>(defaultAppConfig);
@@ -114,8 +126,9 @@ export const DashboardWindow: React.FC = () => {
   const refreshAll = useCallback(async () => {
     setLoading(true);
     try {
-      const [ollamaRes, hwRes, memRes, cfgRes, modelsRes, mcpRes] = await Promise.allSettled([
+      const [ollamaRes, codexRes, hwRes, memRes, cfgRes, modelsRes, mcpRes] = await Promise.allSettled([
         invokeCommand<OllamaStatus>("check_ollama_status"),
+        getCodexAuthStatus(),
         invokeCommand<any>("get_hardware_profile"),
         invokeCommand<MemoryEntry[]>("get_memories"),
         invokeCommand<any>("get_config"),
@@ -123,6 +136,12 @@ export const DashboardWindow: React.FC = () => {
         invokeCommand<any[]>("get_mcp_servers"),
       ]);
       if (ollamaRes.status === "fulfilled") setOllama(ollamaRes.value);
+      if (codexRes.status === "fulfilled" && codexRes.value) {
+        setCodexAuth({
+          ...codexRes.value,
+          model: codexRes.value.model?.trim() || "gpt-6-luna",
+        });
+      }
       if (hwRes.status === "fulfilled" && hwRes.value) {
         setHardware(hwRes.value);
         setHardwareProfile({
@@ -145,6 +164,8 @@ export const DashboardWindow: React.FC = () => {
           },
           selectedLocalModel: c.local_model_name || prev.selectedLocalModel,
           local_llama_url: c.local_llama_url || prev.local_llama_url,
+          codex_model_name: c.codex_model_name ?? prev.codex_model_name,
+          use_chatgpt_codex_only: c.use_chatgpt_codex_only ?? prev.use_chatgpt_codex_only,
           hotkeys: {
             talk: c.hotkeys?.talk || prev.hotkeys.talk,
             dictation: c.hotkeys?.dictation || prev.hotkeys.dictation,
@@ -179,7 +200,19 @@ export const DashboardWindow: React.FC = () => {
     const next = { ...config, ...updated };
     setConfig(next);
     try {
-      const currentRaw = await invokeCommand<Record<string, unknown>>("get_config").catch(() => ({}));
+      const currentRaw: Record<string, unknown> = await invokeCommand<Record<string, unknown>>("get_config").catch(
+        () => ({} as Record<string, unknown>)
+      );
+      const preservedCodexModel =
+        updated.codex_model_name ??
+        (typeof currentRaw.codex_model_name === "string"
+          ? currentRaw.codex_model_name
+          : next.codex_model_name ?? "gpt-6-luna");
+      const preservedCodexOnly =
+        updated.use_chatgpt_codex_only ??
+        (typeof currentRaw.use_chatgpt_codex_only === "boolean"
+          ? currentRaw.use_chatgpt_codex_only
+          : next.use_chatgpt_codex_only ?? true);
       await invokeCommand("save_config", {
         config: {
           ...currentRaw,
@@ -188,6 +221,8 @@ export const DashboardWindow: React.FC = () => {
           openrouter_api_key: next.apiKeys?.openrouter?.trim() || null,
           local_llama_url: next.local_llama_url || "http://127.0.0.1:11434",
           local_model_name: next.selectedLocalModel || "bonsai-2:9b",
+          codex_model_name: preservedCodexModel,
+          use_chatgpt_codex_only: preservedCodexOnly,
           hotkeys: {
             talk: next.hotkeys.talk,
             dictation: next.hotkeys.dictation,
@@ -276,8 +311,19 @@ export const DashboardWindow: React.FC = () => {
         duration: 6000,
       });
     });
+    const unlistenCodex = listenEvent<CodexAuthStatus>("codex:auth_changed", (payload) => {
+      if (!payload) return;
+      const resolvedModel = payload.model?.trim() || "gpt-6-luna";
+      setCodexAuth({ ...payload, model: resolvedModel });
+      setConfig((prev) => ({
+        ...prev,
+        codex_model_name: resolvedModel,
+        use_chatgpt_codex_only: payload.codex_only,
+      }));
+    });
     return () => {
       unlistenErr.then((fn) => fn && fn());
+      unlistenCodex.then((fn) => fn && fn());
     };
   }, [refreshAll]);
 
@@ -403,8 +449,46 @@ export const DashboardWindow: React.FC = () => {
                 initial={{ opacity: 0, y: 6 }}
                 animate={{ opacity: 1, y: 0 }}
                 transition={{ duration: 0.18 }}
-                className="grid grid-cols-1 md:grid-cols-3 gap-4"
+                className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4"
               >
+                <Card className="p-4 space-y-1.5">
+                  <div className="flex items-center justify-between text-xs text-zinc-400">
+                    <span>ChatGPT Codex</span>
+                    <Sparkles
+                      className={`w-4 h-4 ${
+                        codexAuth.authenticated ? "text-emerald-400" : "text-zinc-500"
+                      }`}
+                    />
+                  </div>
+                  {codexAuth.authenticated ? (
+                    <>
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="inline-flex items-center gap-1.5 text-base font-semibold text-emerald-400">
+                          <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse shrink-0" />
+                          Connected · {codexAuth.model || "gpt-6-luna"}
+                        </span>
+                      </div>
+                      <p
+                        className="text-xs text-zinc-500 truncate"
+                        title={codexAuth.email || codexAuth.account_id || undefined}
+                      >
+                        {codexAuth.email || codexAuth.account_id || "ChatGPT OAuth Active"}
+                        {codexAuth.codex_only ? " · LLM Only" : ""}
+                      </p>
+                    </>
+                  ) : (
+                    <>
+                      <div className="flex items-center gap-2">
+                        <span className="text-lg font-semibold text-zinc-100">Not Signed In</span>
+                        <Badge tone="warning">OAuth</Badge>
+                      </div>
+                      <p className="text-xs text-zinc-500">
+                        Connect ChatGPT ({codexAuth.model || "gpt-6-luna"}) in Settings
+                      </p>
+                    </>
+                  )}
+                </Card>
+
                 <Card className="p-4 space-y-1.5">
                   <div className="flex items-center justify-between text-xs text-zinc-400">
                     <span>Ollama Local LLM</span>

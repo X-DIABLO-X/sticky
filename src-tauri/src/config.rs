@@ -43,6 +43,14 @@ pub struct McpServerDto {
     pub enabled: bool,
 }
 
+fn default_codex_model() -> String {
+    "gpt-6-luna".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub hardware_profile: HardwareProfile,
@@ -51,6 +59,10 @@ pub struct AppConfig {
     pub groq_api_key: Option<String>,
     pub gemini_api_key: Option<String>,
     pub openrouter_api_key: Option<String>,
+    #[serde(default = "default_codex_model")]
+    pub codex_model_name: String,
+    #[serde(default = "default_true")]
+    pub use_chatgpt_codex_only: bool,
     pub hotkeys: HotkeyConfig,
     pub home_dir: PathBuf,
     pub models_dir: PathBuf,
@@ -77,6 +89,8 @@ impl Default for AppConfig {
             groq_api_key: std::env::var("GROQ_API_KEY").ok(),
             gemini_api_key: std::env::var("GEMINI_API_KEY").ok(),
             openrouter_api_key: std::env::var("OPENROUTER_API_KEY").ok(),
+            codex_model_name: default_codex_model(),
+            use_chatgpt_codex_only: true,
             hotkeys: HotkeyConfig::default(),
             models_dir: base_dir.join("models"),
             agents_dir: base_dir.join("agents"),
