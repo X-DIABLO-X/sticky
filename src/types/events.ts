@@ -12,21 +12,41 @@ export interface OverlayPointEvent {
 
 export type DrawShape =
   | "line"
+  | "dashed"
   | "arrow"
   | "curve"
   | "polygon"
+  | "polyline"
   | "circle"
+  | "ellipse"
   | "box"
   | "text";
 
 export interface OverlayDrawEvent {
   id?: string;
   shape: DrawShape;
-  coords: number[]; // Normalized 0..1000: line/arrow/box [x1,y1,x2,y2], curve [x1,y1,cx,cy,x2,y2], polygon [x1,y1,...], circle [cx,cy,r], text [x,y]
+  coords: number[]; // Normalized 0..1000: line/dashed/arrow/box [x1,y1,x2,y2], curve [x1,y1,cx,cy,x2,y2], polygon/polyline [x1,y1,...], circle [cx,cy,r], ellipse [cx,cy,rx,ry], text [x,y]
   label?: string;
   color?: string;
-  fadeMs?: number; // Default 8000ms
+  fadeMs?: number; // Default 14000ms (only applies when persistent === false)
   persistent?: boolean;
+  style?: "sketch" | "clean";
+}
+
+export type VizKind = "html" | "canvas" | "svg" | "mermaid" | "three" | "chart";
+
+export interface OverlayVizEvent {
+  id: string;
+  kind: VizKind;
+  title: string;
+  code: string;
+  width?: number;
+  height?: number;
+}
+
+export interface OverlayVizLoadingEvent {
+  kind: string;
+  title: string;
 }
 
 export interface PartPin {

@@ -352,6 +352,14 @@ export async function invokeCommand<T>(command: string, args?: Record<string, un
         reply: "Sticky ChatGPT Codex connection OK.",
         latency_ms: 142,
       } as unknown as T;
+    case "trigger_overlay_demo":
+      if (args?.preset) mockBus.emit("overlay:demo", args.preset);
+      return undefined as unknown as T;
+    case "clear_overlay":
+      mockBus.emit("overlay:clear_drawings", undefined);
+      mockBus.emit("overlay:point_clear", undefined);
+      mockBus.emit("overlay:command", { type: "VizClose" });
+      return undefined as unknown as T;
     default:
       return {} as unknown as T;
   }
@@ -399,6 +407,14 @@ export async function testCodexLlm(
   return invokeCommand<{ model: string; reply: string; latency_ms: number }>("test_codex_llm", { prompt });
 }
 
+export async function triggerOverlayDemo(preset: string): Promise<void> {
+  return invokeCommand<void>("trigger_overlay_demo", { preset });
+}
+
+export async function clearOverlay(): Promise<void> {
+  return invokeCommand<void>("clear_overlay");
+}
+
 /**
  * Listen for events emitted by the Rust core or mock bus
  */
@@ -431,10 +447,15 @@ export async function emitEvent<T>(eventName: string, payload: T): Promise<void>
 export async function setIgnoreCursorEvents(ignore: boolean): Promise<void> {
   if (isTauri()) {
     try {
-      const win = getCurrentWindow();
-      await win.setIgnoreCursorEvents(ignore);
-    } catch (err) {
-      console.warn("setIgnoreCursorEvents failed:", err);
+      // Route through Rust WindowManager so OVERLAY_CLICK_THROUGH stays synced with the 750ms topmost keeper
+      await invoke("set_ignore_cursor_events", { ignore });
+    } catch {
+      try {
+        const win = getCurrentWindow();
+        await win.setIgnoreCursorEvents(ignore);
+      } catch (err) {
+        console.warn("setIgnoreCursorEvents failed:", err);
+      }
     }
   } else {
     // In browser, toggle pointer-events on the overlay body

@@ -3,18 +3,24 @@ import { motion } from "framer-motion";
 import { Toaster, toast } from "sonner";
 import {
   Activity,
+  BarChart3,
   Bot,
+  Box,
   Clock,
   Cpu,
   Database,
+  Eraser,
+  GitBranch,
   Mic,
+  PenTool,
   RefreshCw,
   Settings,
   Sparkles,
   Terminal,
   Trash2,
+  Waves,
 } from "lucide-react";
-import { getCodexAuthStatus, invokeCommand, listenEvent } from "../lib/ipc";
+import { clearOverlay, getCodexAuthStatus, invokeCommand, listenEvent, triggerOverlayDemo } from "../lib/ipc";
 import {
   Badge,
   Button,
@@ -528,6 +534,90 @@ export const DashboardWindow: React.FC = () => {
                   <p className="text-xs text-zinc-500">Stored locally in SQLite</p>
                 </Card>
               </motion.div>
+
+              <Card className="p-4 space-y-3 border-emerald-500/20">
+                <div className="flex items-center justify-between gap-2 flex-wrap">
+                  <div>
+                    <h2 className="text-xs font-semibold uppercase tracking-wider text-emerald-400 flex items-center gap-1.5">
+                      <PenTool className="w-3.5 h-3.5" />
+                      Drawing & Live Visualization Studio
+                    </h2>
+                    <p className="text-[11px] text-zinc-400 mt-0.5">
+                      Launch persistent Rough.js screen sketches or interactive HTML5 Canvas / Three.js / Mermaid / Chart widgets directly over your desktop.
+                    </p>
+                  </div>
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    onClick={async () => {
+                      await clearOverlay();
+                      toast.info("Cleared overlay drawings & visual stage");
+                    }}
+                  >
+                    <Eraser className="w-3.5 h-3.5 text-rose-400" />
+                    Clear Overlay (Esc)
+                  </Button>
+                </div>
+
+                <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2">
+                  {[
+                    {
+                      id: "sketch_diagram",
+                      label: "Rough.js Sketch",
+                      sub: "Persistent whiteboard",
+                      icon: <PenTool className="w-3.5 h-3.5 text-emerald-400" />,
+                    },
+                    {
+                      id: "spring_vs_easing",
+                      label: "Spring vs Easing",
+                      sub: "Interactive Canvas",
+                      icon: <Waves className="w-3.5 h-3.5 text-cyan-400" />,
+                    },
+                    {
+                      id: "three_subdiv_cube",
+                      label: "3D Three.js Scene",
+                      sub: "Orbit + Wireframe",
+                      icon: <Box className="w-3.5 h-3.5 text-violet-400" />,
+                    },
+                    {
+                      id: "mermaid_flow",
+                      label: "Mermaid Diagram",
+                      sub: "Live SVG Flowchart",
+                      icon: <GitBranch className="w-3.5 h-3.5 text-amber-400" />,
+                    },
+                    {
+                      id: "interactive_chart",
+                      label: "Interactive Chart",
+                      sub: "Curves + Tooltips",
+                      icon: <BarChart3 className="w-3.5 h-3.5 text-sky-400" />,
+                    },
+                  ].map((demo) => (
+                    <button
+                      key={demo.id}
+                      type="button"
+                      onClick={async () => {
+                        try {
+                          await triggerOverlayDemo(demo.id);
+                          toast.success(`Launched ${demo.label}`, {
+                            description: "Hover the floating stage to drag, resize, orbit, or adjust sliders.",
+                          });
+                        } catch (err) {
+                          toast.error(`Failed to launch ${demo.label}`, {
+                            description: err instanceof Error ? err.message : String(err),
+                          });
+                        }
+                      }}
+                      className="p-2.5 rounded-xl bg-zinc-900/80 hover:bg-zinc-800 border border-white/[0.08] hover:border-emerald-400/45 text-left transition-all flex flex-col gap-1"
+                    >
+                      <div className="flex items-center gap-1.5 text-xs font-medium text-zinc-100">
+                        {demo.icon}
+                        <span>{demo.label}</span>
+                      </div>
+                      <span className="text-[10px] text-zinc-400">{demo.sub}</span>
+                    </button>
+                  ))}
+                </div>
+              </Card>
 
               <Card className="p-4">
                 <h2 className="text-xs font-semibold uppercase tracking-wider text-zinc-400 mb-3">

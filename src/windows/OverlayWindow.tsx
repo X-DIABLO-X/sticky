@@ -1,9 +1,12 @@
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import { listenEvent, setIgnoreCursorEvents, invokeCommand } from "../lib/ipc";
 import type {
   OverlayPointEvent,
   OverlayDrawEvent,
   Overlay3DEvent,
+  OverlayVizEvent,
+  OverlayVizLoadingEvent,
+  VizKind,
   WalkthroughStep,
   DriveStatusEvent,
   DriveConfirmationPayload,
@@ -13,14 +16,29 @@ import { GuidedStepBox } from "../components/overlay/GuidedStepBox";
 import { DriveBorder } from "../components/overlay/DriveBorder";
 import { Model3DViewer } from "../components/overlay/Model3DViewer";
 import { CursorFollower } from "../components/overlay/CursorFollower";
+import { VisualizationStage } from "../components/overlay/VisualizationStage";
+import { DEMO_SKETCH_DRAWINGS, VIZ_PRESETS } from "../components/overlay/vizPresets";
 import { StreamingTagParser } from "../lib/pointParser";
-import { Sparkles, Eye, ShieldAlert, Navigation, Edit3, Box } from "lucide-react";
+import {
+  Sparkles,
+  Navigation,
+  Box,
+  Pencil,
+  Activity,
+  GitBranch,
+  BarChart3,
+  Trash2,
+} from "lucide-react";
+
+const HIT_TEST_PADDING_PX = 6;
 
 export const OverlayWindow: React.FC = () => {
   const [point, setPoint] = useState<OverlayPointEvent | null>(null);
   const [drawings, setDrawings] = useState<OverlayDrawEvent[]>([]);
   const [clearDrawingsSignal, setClearDrawingsSignal] = useState(0);
   const [model3D, setModel3D] = useState<Overlay3DEvent | null>(null);
+  const [vizEvent, setVizEvent] = useState<OverlayVizEvent | null>(null);
+  const [vizLoading, setVizLoading] = useState<OverlayVizLoadingEvent | null>(null);
   const [walkthroughStep, setWalkthroughStep] = useState<WalkthroughStep | null>(null);
   const [walkthroughIndex, setWalkthroughIndex] = useState(0);
   const [walkthroughTotal, setWalkthroughTotal] = useState(0);
@@ -36,7 +54,68 @@ export const OverlayWindow: React.FC = () => {
     instruction: string;
   }>({ active: false, step: 0, goal: "", instruction: "" });
 
+  // 60FPS Windows Interactive Hit-Test Controller refs
+  const interactiveRectsRef = useRef<Map<string, DOMRect>>(new Map());
+  const isIgnoringCursorRef = useRef<boolean>(true);
+  const isShiftDownRef = useRef<boolean>(false);
+  const lastCursorRef = useRef<{ x: number; y: number }>({ x: -9999, y: -9999 });
+
+  const devControlsRef = useRef<HTMLDivElement | null>(null);
+  const model3DHostRef = useRef<HTMLDivElement | null>(null);
+  const demoSketchTimerRef = useRef<number | null>(null);
+
+  const evaluateHitTest = useCallback((mx: number, my: number) => {
+    let insideAny = isShiftDownRef.current;
+
+    if (!insideAny) {
+      for (const rect of interactiveRectsRef.current.values()) {
+        if (rect.width <= 0 || rect.height <= 0) continue;
+        if (
+          mx >= rect.left - HIT_TEST_PADDING_PX &&
+          mx <= rect.right + HIT_TEST_PADDING_PX &&
+          my >= rect.top - HIT_TEST_PADDING_PX &&
+          my <= rect.bottom + HIT_TEST_PADDING_PX
+        ) {
+          insideAny = true;
+          break;
+        }
+      }
+    }
+
+    const nextIgnore = !insideAny;
+    if (nextIgnore !== isIgnoringCursorRef.current) {
+      isIgnoringCursorRef.current = nextIgnore;
+      setIgnoreCursorEvents(nextIgnore);
+    }
+  }, []);
+
+  const registerInteractiveRect = useCallback(
+    (key: string, rect: DOMRect | null) => {
+      if (rect && rect.width > 0 && rect.height > 0) {
+        interactiveRectsRef.current.set(key, rect);
+      } else {
+        interactiveRectsRef.current.delete(key);
+      }
+      evaluateHitTest(lastCursorRef.current.x, lastCursorRef.current.y);
+    },
+    [evaluateHitTest]
+  );
+
+  const handleVizRectChange = useCallback(
+    (rect: DOMRect | null) => registerInteractiveRect("viz-stage", rect),
+    [registerInteractiveRect]
+  );
+
+  const handleDrawingToolbarRect = useCallback(
+    (rect: DOMRect | null) => registerInteractiveRect("drawing-toolbar", rect),
+    [registerInteractiveRect]
+  );
+
   const handleClearDrawings = useCallback(() => {
+    if (demoSketchTimerRef.current !== null) {
+      window.clearTimeout(demoSketchTimerRef.current);
+      demoSketchTimerRef.current = null;
+    }
     setDrawings([]);
     setClearDrawingsSignal((n) => n + 1);
   }, []);
@@ -45,12 +124,192 @@ export const OverlayWindow: React.FC = () => {
     setPoint(null);
   }, []);
 
-  // Initialize click-through hit-testing on mount
+  const handleCloseViz = useCallback(() => {
+    setVizEvent(null);
+    setVizLoading(null);
+  }, []);
+
+  const handleClearAll = useCallback(() => {
+    if (demoSketchTimerRef.current !== null) {
+      window.clearTimeout(demoSketchTimerRef.current);
+      demoSketchTimerRef.current = null;
+    }
+    setPoint(null);
+    setDrawings([]);
+    setClearDrawingsSignal((n) => n + 1);
+    setVizEvent(null);
+    setVizLoading(null);
+    setModel3D(null);
+    setWalkthroughStep(null);
+  }, []);
+
+  const triggerDemoPreset = useCallback((rawPreset: string) => {
+    const preset = (rawPreset || "").trim().toLowerCase();
+    if (!preset) return;
+
+    if (preset === "clear" || preset === "clear_all") {
+      handleClearAll();
+      return;
+    }
+
+    if (preset === "sketch_diagram") {
+      if (demoSketchTimerRef.current !== null) {
+        window.clearTimeout(demoSketchTimerRef.current);
+      }
+      // Clear first so DrawingCanvas's clearSignal effect runs before adding the fresh sketch
+      setDrawings([]);
+      setClearDrawingsSignal((n) => n + 1);
+      const stamp = Date.now();
+      demoSketchTimerRef.current = window.setTimeout(() => {
+        demoSketchTimerRef.current = null;
+        setDrawings(
+          DEMO_SKETCH_DRAWINGS.map((d, idx) => ({
+            ...d,
+            id: `${d.id || "demo-sketch"}-${stamp}-${idx}`,
+            persistent: true,
+          }))
+        );
+      }, 24);
+      return;
+    }
+
+    const found = VIZ_PRESETS[preset];
+    if (found) {
+      setVizLoading(null);
+      setVizEvent({
+        ...found,
+        id: `${found.id}-${Date.now()}`,
+      });
+    }
+  }, [handleClearAll]);
+
+  // Register Dev Controls DOMRect continuously via ResizeObserver
   useEffect(() => {
-    // Start with total click-through transparent mode
+    const el = devControlsRef.current;
+    if (!el) {
+      registerInteractiveRect("dev-controls", null);
+      return;
+    }
+    const sync = () => registerInteractiveRect("dev-controls", el.getBoundingClientRect());
+    sync();
+    const ro = new ResizeObserver(sync);
+    ro.observe(el);
+    window.addEventListener("resize", sync);
+    return () => {
+      ro.disconnect();
+      window.removeEventListener("resize", sync);
+      registerInteractiveRect("dev-controls", null);
+    };
+  }, [showDevControls, registerInteractiveRect]);
+
+  // Register Model3DViewer DOMRect when active (including while dragged)
+  useEffect(() => {
+    if (!model3D || model3D.visible === false) {
+      registerInteractiveRect("model-3d", null);
+      return;
+    }
+
+    const sync = () => {
+      const target = model3DHostRef.current?.firstElementChild;
+      registerInteractiveRect(
+        "model-3d",
+        target ? target.getBoundingClientRect() : null
+      );
+    };
+
+    sync();
+    const host = model3DHostRef.current;
+    const mo = host ? new MutationObserver(sync) : null;
+    if (host && mo) {
+      mo.observe(host, {
+        attributes: true,
+        subtree: true,
+        childList: true,
+        attributeFilter: ["style", "class"],
+      });
+    }
+    const ro =
+      host?.firstElementChild ? new ResizeObserver(sync) : null;
+    if (host?.firstElementChild && ro) {
+      ro.observe(host.firstElementChild);
+    }
+    window.addEventListener("resize", sync);
+
+    return () => {
+      mo?.disconnect();
+      ro?.disconnect();
+      window.removeEventListener("resize", sync);
+      registerInteractiveRect("model-3d", null);
+    };
+  }, [model3D, registerInteractiveRect]);
+
+  // 60FPS Windows cursor_pos hit-test controller + Shift-draw + Escape hotkey
+  useEffect(() => {
+    isIgnoringCursorRef.current = true;
     setIgnoreCursorEvents(true);
 
-    // Setup streaming tag parser
+    const unlistenCursor = listenEvent<{ x: number; y: number }>(
+      "cursor_pos",
+      (data) => {
+        if (!data) return;
+        const dpr = window.devicePixelRatio || 1;
+        const mx = data.x / dpr;
+        const my = data.y / dpr;
+        lastCursorRef.current = { x: mx, y: my };
+        evaluateHitTest(mx, my);
+      }
+    );
+
+    const handleLocalMouseMove = (e: MouseEvent) => {
+      lastCursorRef.current = { x: e.clientX, y: e.clientY };
+      evaluateHitTest(e.clientX, e.clientY);
+    };
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Shift") {
+        if (!isShiftDownRef.current) {
+          isShiftDownRef.current = true;
+          evaluateHitTest(lastCursorRef.current.x, lastCursorRef.current.y);
+        }
+      } else if (e.ctrlKey && e.shiftKey && e.key.toUpperCase() === "O") {
+        setShowDevControls((prev) => !prev);
+      } else if (e.key === "Escape") {
+        handleClearDrawings();
+        handleCloseViz();
+        setPoint(null);
+      }
+    };
+
+    const handleKeyUp = (e: KeyboardEvent) => {
+      if (e.key === "Shift") {
+        isShiftDownRef.current = false;
+        evaluateHitTest(lastCursorRef.current.x, lastCursorRef.current.y);
+      }
+    };
+
+    const handleBlur = () => {
+      if (isShiftDownRef.current) {
+        isShiftDownRef.current = false;
+        evaluateHitTest(lastCursorRef.current.x, lastCursorRef.current.y);
+      }
+    };
+
+    window.addEventListener("mousemove", handleLocalMouseMove, { passive: true });
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("keyup", handleKeyUp);
+    window.addEventListener("blur", handleBlur);
+
+    return () => {
+      unlistenCursor.then((u) => u());
+      window.removeEventListener("mousemove", handleLocalMouseMove);
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("keyup", handleKeyUp);
+      window.removeEventListener("blur", handleBlur);
+    };
+  }, [evaluateHitTest, handleClearDrawings, handleCloseViz]);
+
+  // Listen to backend overlay commands, demo showcase events, and runtime state
+  useEffect(() => {
     const tagParser = new StreamingTagParser({
       onPoint: (p) => setPoint(p),
       onDraw: (d) => setDrawings((prev) => [...prev, d]),
@@ -62,7 +321,6 @@ export const OverlayWindow: React.FC = () => {
       },
     });
 
-    // Listen for direct Rust backend IPC events
     const unlistenCmd = listenEvent<any>("overlay:command", (cmd) => {
       if (!cmd) return;
       if (cmd.type === "Point" && cmd.payload) {
@@ -83,6 +341,7 @@ export const OverlayWindow: React.FC = () => {
             color: cmd.payload.color || "#10b981",
             fadeMs: cmd.payload.fadeMs,
             persistent: cmd.payload.persistent,
+            style: cmd.payload.style,
           },
         ]);
       } else if (cmd.type === "ClearDrawings") {
@@ -103,8 +362,40 @@ export const OverlayWindow: React.FC = () => {
         });
         setWalkthroughIndex((cmd.payload.index || 1) - 1);
         setWalkthroughTotal(cmd.payload.total || 1);
+      } else if (cmd.type === "VizLoading") {
+        const p = cmd.payload || {};
+        setVizEvent(null);
+        setVizLoading({
+          kind: p.kind || "html",
+          title: p.title || "Interactive Visualization",
+        });
+      } else if (cmd.type === "VizRender" && cmd.payload) {
+        const p = cmd.payload;
+        setVizLoading(null);
+        setVizEvent({
+          id: p.id || `viz_${Date.now()}`,
+          kind: (p.kind || "html") as VizKind,
+          title: p.title || "Live Visualization",
+          code: p.code || "",
+          width: typeof p.width === "number" ? p.width : undefined,
+          height: typeof p.height === "number" ? p.height : undefined,
+        });
+      } else if (cmd.type === "VizClose") {
+        setVizEvent(null);
+        setVizLoading(null);
       }
     });
+
+    const unlistenDemo = listenEvent<string | { preset?: string }>(
+      "overlay:demo",
+      (payload) => {
+        if (typeof payload === "string") {
+          triggerDemoPreset(payload);
+        } else if (payload && typeof payload.preset === "string") {
+          triggerDemoPreset(payload.preset);
+        }
+      }
+    );
 
     const unlistenPointClear = listenEvent("overlay:point_clear", () => {
       setPoint(null);
@@ -144,17 +435,9 @@ export const OverlayWindow: React.FC = () => {
       tagParser.feed(chunk.textChunk);
     });
 
-    // Keyboard toggle for dev test toolbar (`Ctrl+Shift+O`)
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.ctrlKey && e.shiftKey && e.key === "O") {
-        setShowDevControls((prev) => !prev);
-      }
-    };
-    window.addEventListener("keydown", handleKeyDown);
-
     return () => {
-      window.removeEventListener("keydown", handleKeyDown);
       unlistenCmd.then((u) => u());
+      unlistenDemo.then((u) => u());
       unlistenPointClear.then((u) => u());
       unlistenClearDrawings.then((u) => u());
       unlistenGuideState.then((u) => u());
@@ -163,7 +446,7 @@ export const OverlayWindow: React.FC = () => {
       unlistenDict.then((u) => u());
       unlistenStream.then((u) => u());
     };
-  }, []);
+  }, [triggerDemoPreset]);
 
   // Drive action confirmations
   const handleApproveDrive = async (payload: DriveConfirmationPayload) => {
@@ -178,7 +461,10 @@ export const OverlayWindow: React.FC = () => {
 
   const handleAbortDrive = async () => {
     await invokeCommand("abort_drive_mode");
-    setDriveStatus({ state: "aborted", actionDescription: "Watchdog triggered: Esc or Mouse move." });
+    setDriveStatus({
+      state: "aborted",
+      actionDescription: "Watchdog triggered: Esc or Mouse move.",
+    });
     setTimeout(() => setDriveStatus(null), 3000);
   };
 
@@ -209,7 +495,7 @@ export const OverlayWindow: React.FC = () => {
         guidedMode={guideHud.active || walkthroughStep !== null}
       />
 
-      {/* 1. Expressive Vector Whiteboard Canvas & Draw-to-Focus Capture */}
+      {/* 1. Expressive Rough.js Vector Whiteboard Canvas & Draw-to-Focus Capture */}
       <DrawingCanvas
         externalDrawings={drawings}
         clearSignal={clearDrawingsSignal}
@@ -219,6 +505,15 @@ export const OverlayWindow: React.FC = () => {
           invokeCommand("analyze_screen_region", { bbox });
         }}
         onClearAll={handleClearDrawings}
+        onRegisterToolbarRect={handleDrawingToolbarRect}
+      />
+
+      {/* 2. HeyClicky-Grade Live Code Visualization Stage (HTML / Three.js / Mermaid / SVG / Chart) */}
+      <VisualizationStage
+        viz={vizEvent}
+        loading={vizLoading}
+        onClose={handleCloseViz}
+        onRectChange={handleVizRectChange}
       />
 
       {/* Live Step-by-Step Guide HUD Banner */}
@@ -236,7 +531,7 @@ export const OverlayWindow: React.FC = () => {
         </div>
       )}
 
-      {/* 2. Interactive Guided Walkthrough Target Box */}
+      {/* 3. Interactive Guided Walkthrough Target Box */}
       <GuidedStepBox
         step={walkthroughStep}
         currentStepIndex={walkthroughIndex}
@@ -246,7 +541,7 @@ export const OverlayWindow: React.FC = () => {
         onClose={() => setWalkthroughStep(null)}
       />
 
-      {/* 3. Drive Mode Glowing Perimeter Border & Confirmation Modal */}
+      {/* 4. Drive Mode Glowing Perimeter Border & Confirmation Modal */}
       <DriveBorder
         status={driveStatus}
         onConfirmAction={handleApproveDrive}
@@ -254,36 +549,77 @@ export const OverlayWindow: React.FC = () => {
         onAbortDrive={handleAbortDrive}
       />
 
-      {/* 4. Three.js 3D Interactive Spatial Object Viewer */}
+      {/* 5. Three.js 3D Interactive Spatial Object Viewer */}
       {model3D && model3D.visible && (
-        <Model3DViewer model={model3D} onClose={() => setModel3D(null)} />
+        <div ref={model3DHostRef} className="contents">
+          <Model3DViewer model={model3D} onClose={() => setModel3D(null)} />
+        </div>
       )}
 
-      {/* Developer Testing Bar (Toggle with Ctrl+Shift+O or hover bottom right) */}
+      {/* Developer Sandbox & Live Showcase Bar (Toggle with Ctrl+Shift+O) */}
       <div
+        ref={devControlsRef}
         className="fixed bottom-3 right-3 z-50 pointer-events-auto"
-        onMouseEnter={() => setIgnoreCursorEvents(false)}
-        onMouseLeave={() => setIgnoreCursorEvents(true)}
       >
         {!showDevControls ? (
           <button
             onClick={() => setShowDevControls(true)}
-            className="p-1.5 rounded-full bg-slate-900/80 border border-white/10 hover:border-sky-400 text-slate-400 hover:text-sky-300 shadow-xl backdrop-blur-md transition-all"
-            title="Open Spatial Overlay Dev Sandbox (Ctrl+Shift+O)"
+            className="p-2 rounded-full bg-zinc-950/85 border border-emerald-400/30 hover:border-emerald-400 text-zinc-400 hover:text-emerald-300 shadow-xl backdrop-blur-md transition-all"
+            title="Open Spatial Overlay Sandbox (Ctrl+Shift+O)"
           >
             <Sparkles className="w-3.5 h-3.5" />
           </button>
         ) : (
-          <div className="flex items-center gap-1.5 p-2 rounded-2xl glass-panel border border-sky-400/40 shadow-2xl animate-float text-xs">
-            <span className="text-[10px] font-bold text-sky-400 uppercase tracking-wider px-1">
-              Dev Sandbox
+          <div className="flex flex-wrap items-center gap-1.5 p-2 rounded-2xl bg-zinc-950/[0.92] border border-emerald-400/40 shadow-[0_14px_40px_rgba(0,0,0,0.75)] backdrop-blur-xl text-xs">
+            <span className="text-[10px] font-bold text-emerald-400 uppercase tracking-wider px-1.5">
+              Showcase
             </span>
+
+            {/* Sketch Diagram */}
+            <button
+              onClick={() => triggerDemoPreset("sketch_diagram")}
+              className="flex items-center gap-1 px-2 py-1 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-400/35 transition-colors"
+            >
+              <Pencil className="w-3 h-3" /> Sketch
+            </button>
+
+            {/* Spring Physics Viz */}
+            <button
+              onClick={() => triggerDemoPreset("spring_vs_easing")}
+              className="flex items-center gap-1 px-2 py-1 rounded-lg bg-cyan-500/15 hover:bg-cyan-500/25 text-cyan-300 border border-cyan-400/35 transition-colors"
+            >
+              <Activity className="w-3 h-3" /> Spring Viz
+            </button>
+
+            {/* Three.js 3D Scene */}
+            <button
+              onClick={() => triggerDemoPreset("three_subdiv_cube")}
+              className="flex items-center gap-1 px-2 py-1 rounded-lg bg-sky-500/15 hover:bg-sky-500/25 text-sky-300 border border-sky-400/35 transition-colors"
+            >
+              <Box className="w-3 h-3" /> 3D Scene
+            </button>
+
+            {/* Mermaid Flowchart */}
+            <button
+              onClick={() => triggerDemoPreset("mermaid_flow")}
+              className="flex items-center gap-1 px-2 py-1 rounded-lg bg-violet-500/15 hover:bg-violet-500/25 text-violet-300 border border-violet-400/35 transition-colors"
+            >
+              <GitBranch className="w-3 h-3" /> Mermaid
+            </button>
+
+            {/* Interactive Chart */}
+            <button
+              onClick={() => triggerDemoPreset("interactive_chart")}
+              className="flex items-center gap-1 px-2 py-1 rounded-lg bg-teal-500/15 hover:bg-teal-500/25 text-teal-300 border border-teal-400/35 transition-colors"
+            >
+              <BarChart3 className="w-3 h-3" /> Chart
+            </button>
 
             {/* Test Point */}
             <button
               onClick={() => {
-                const rx = Math.floor(Math.random() * 800) + 100;
-                const ry = Math.floor(Math.random() * 600) + 100;
+                const rx = Math.floor(Math.random() * 680) + 160;
+                const ry = Math.floor(Math.random() * 440) + 140;
                 setPoint({
                   x: Math.round((rx / window.innerWidth) * 1000),
                   y: Math.round((ry / window.innerHeight) * 1000),
@@ -291,98 +627,35 @@ export const OverlayWindow: React.FC = () => {
                   durationMs: 420,
                 });
               }}
-              className="flex items-center gap-1 px-2 py-1 rounded-lg bg-sky-500/20 hover:bg-sky-500/30 text-sky-300 border border-sky-400/30"
+              className="flex items-center gap-1 px-2 py-1 rounded-lg bg-zinc-800/80 hover:bg-zinc-700/80 text-zinc-200 border border-white/10 transition-colors"
             >
               <Navigation className="w-3 h-3" /> Point
             </button>
 
-            {/* Test Draw Box */}
-            <button
-              onClick={() => {
-                setDrawings((prev) => [
-                  ...prev,
-                  {
-                    id: `dev-box-${Date.now()}`,
-                    shape: "box",
-                    coords: [350, 350, 650, 650],
-                    label: "Critical Form Area",
-                    color: "#10b981",
-                    fadeMs: 8000,
-                  },
-                ]);
-              }}
-              className="flex items-center gap-1 px-2 py-1 rounded-lg bg-purple-500/20 hover:bg-purple-500/30 text-purple-300 border border-purple-400/30"
-            >
-              <Edit3 className="w-3 h-3" /> Draw Box
-            </button>
-
-            {/* Test 3D Object */}
-            <button
-              onClick={() => {
-                setModel3D({
-                  id: "robot-gadget",
-                  title: "Cybernetic Sensor Node",
-                  geometryType: "robot",
-                  visible: true,
-                });
-              }}
-              className="flex items-center gap-1 px-2 py-1 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-400/30"
-            >
-              <Box className="w-3 h-3" /> 3D View
-            </button>
-
             {/* Toggle Cursor Follower */}
             <button
-              onClick={() => setShowFollower(!showFollower)}
-              className={`flex items-center gap-1 px-2 py-1 rounded-lg border transition-all ${
+              onClick={() => setShowFollower((v) => !v)}
+              className={`flex items-center gap-1 px-2 py-1 rounded-lg border transition-colors ${
                 showFollower
-                  ? "bg-cyan-500/20 text-cyan-300 border-cyan-400/40"
-                  : "bg-slate-800 text-slate-400 border-slate-700"
+                  ? "bg-emerald-500/15 text-emerald-200 border-emerald-400/30"
+                  : "bg-zinc-900 text-zinc-500 border-white/10"
               }`}
             >
-              <Sparkles className="w-3 h-3" /> Follower {showFollower ? "ON" : "OFF"}
+              <Sparkles className="w-3 h-3" /> {showFollower ? "Cursor ON" : "Cursor OFF"}
             </button>
 
-            {/* Test Guided Walkthrough */}
+            {/* Clear All */}
             <button
-              onClick={() => {
-                setWalkthroughStep({
-                  step: 1,
-                  instruction: "Click this primary button to deploy the fullstack project workspace.",
-                  bbox: [220, 160, 480, 240],
-                });
-                setWalkthroughIndex(0);
-                setWalkthroughTotal(3);
-              }}
-              className="flex items-center gap-1 px-2 py-1 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-400/30"
+              onClick={handleClearAll}
+              className="flex items-center gap-1 px-2 py-1 rounded-lg bg-rose-500/15 hover:bg-rose-500/25 text-rose-300 border border-rose-400/35 transition-colors"
             >
-              <Eye className="w-3 h-3" /> Walkthrough
-            </button>
-
-            {/* Test Drive Warning */}
-            <button
-              onClick={() => {
-                setDriveStatus({
-                  state: "driving",
-                  actionDescription: "Automating Chrome checkout flow...",
-                  requiresConfirmation: true,
-                  confirmationPayload: {
-                    toolCallId: "tool-test-1",
-                    toolName: "mouse_click",
-                    description: "Simulate click at (450, 680) to confirm order payment.",
-                    parameters: { x: 450, y: 680, button: "left" },
-                    severity: "high",
-                  },
-                });
-              }}
-              className="flex items-center gap-1 px-2 py-1 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 border border-rose-400/30"
-            >
-              <ShieldAlert className="w-3 h-3" /> Drive Gate
+              <Trash2 className="w-3 h-3" /> Clear All
             </button>
 
             <button
               onClick={() => setShowDevControls(false)}
-              className="text-slate-400 hover:text-white px-1.5 py-0.5"
+              className="text-zinc-400 hover:text-white px-1.5 py-0.5 rounded hover:bg-white/10 transition-colors"
+              title="Collapse Sandbox"
             >
               ✕
             </button>

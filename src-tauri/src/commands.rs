@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, State};
 
 use crate::ai::local_runner::{HardwareProfileDto, LocalModelSpec};
 use crate::ai::providers::openai_codex::{
@@ -8,6 +8,7 @@ use crate::ai::providers::openai_codex::{
 };
 use crate::ai::providers::{ChatMessage, LlmProvider};
 use crate::ai::router::TaskType;
+use crate::ai::tag_stream::OverlayCommand;
 use crate::ai::AgentRuntime;
 use crate::config::{AppConfig, McpServerDto};
 use crate::error::{AppError, Result};
@@ -71,10 +72,20 @@ pub async fn stop_drive(state: State<'_, AppState>) -> Result<()> {
 
 #[tauri::command]
 pub async fn set_ignore_cursor_events(ignore: bool, app: AppHandle) -> Result<()> {
-    if let Some(win) = app.get_webview_window("overlay") {
-        win.set_ignore_cursor_events(ignore)
-            .map_err(|e| AppError::Config(e.to_string()))?;
-    }
+    WindowManager::set_ignore_cursor_events(&app, "overlay", ignore)
+}
+
+#[tauri::command]
+pub async fn clear_overlay(app: AppHandle) -> Result<()> {
+    let _ = app.emit("overlay:clear_drawings", ());
+    let _ = app.emit("overlay:point_clear", ());
+    let _ = app.emit("overlay:command", &OverlayCommand::VizClose);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn trigger_overlay_demo(preset: String, app: AppHandle) -> Result<()> {
+    let _ = app.emit("overlay:demo", preset);
     Ok(())
 }
 

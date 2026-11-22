@@ -31,6 +31,19 @@ pub enum OverlayCommand {
         model: String,
         title: String,
     },
+    VizLoading {
+        kind: String,
+        title: String,
+    },
+    VizRender {
+        id: String,
+        kind: String,
+        title: String,
+        code: String,
+        width: Option<u32>,
+        height: Option<u32>,
+    },
+    VizClose,
     Step {
         index: usize,
         total: usize,
@@ -44,11 +57,20 @@ pub enum OverlayCommand {
     Raw(String),
 }
 
+const MAX_INLINE_TAG_BYTES: usize = 2048;
+const MAX_VIZ_CODE_BYTES: usize = 65536;
+
 pub struct TagStreamParser {
     tag_buffer: String,
     is_in_tag: bool,
     last_char_was_space: bool,
     just_closed_tag: bool,
+    in_viz_block: bool,
+    viz_kind: String,
+    viz_title: String,
+    viz_width: Option<u32>,
+    viz_height: Option<u32>,
+    viz_code_buffer: String,
 }
 
 impl Default for TagStreamParser {
@@ -64,7 +86,37 @@ impl TagStreamParser {
             is_in_tag: false,
             last_char_was_space: false,
             just_closed_tag: false,
+            in_viz_block: false,
+            viz_kind: String::new(),
+            viz_title: String::new(),
+            viz_width: None,
+            viz_height: None,
+            viz_code_buffer: String::new(),
         }
+    }
+
+    fn finalize_viz_block(&mut self) -> Option<OverlayCommand> {
+        let code = strip_outer_code_fence(&self.viz_code_buffer);
+        let kind = std::mem::take(&mut self.viz_kind);
+        let title = std::mem::take(&mut self.viz_title);
+        let width = self.viz_width.take();
+        let height = self.viz_height.take();
+        self.viz_code_buffer.clear();
+        self.in_viz_block = false;
+        self.just_closed_tag = true;
+
+        if code.is_empty() {
+            return None;
+        }
+
+        Some(OverlayCommand::VizRender {
+            id: uuid::Uuid::new_v4().to_string(),
+            kind,
+            title,
+            code,
+            width,
+            height,
+        })
     }
 
     /// Process an incoming streaming token.
@@ -74,6 +126,22 @@ impl TagStreamParser {
         let mut commands = Vec::new();
 
         for ch in token.chars() {
+            if self.in_viz_block {
+                self.viz_code_buffer.push(ch);
+                if ends_with_viz_close(&self.viz_code_buffer) {
+                    let new_len = self.viz_code_buffer.len() - 6;
+                    self.viz_code_buffer.truncate(new_len);
+                    if let Some(cmd) = self.finalize_viz_block() {
+                        commands.push(cmd);
+                    }
+                } else if self.viz_code_buffer.len() > MAX_VIZ_CODE_BYTES {
+                    if let Some(cmd) = self.finalize_viz_block() {
+                        commands.push(cmd);
+                    }
+                }
+                continue;
+            }
+
             if self.is_in_tag {
                 if ch == '[' {
                     // Unclosed '[' in prose before a real tag: flush old buffer as prose and start fresh
@@ -87,7 +155,16 @@ impl TagStreamParser {
                 if ch == ']' {
                     // Closed bracket: parse tag
                     let tag_content = self.tag_buffer.trim_matches(|c| c == '[' || c == ']');
-                    if let Some(cmd) = parse_tag(tag_content) {
+                    if let Some((kind, title, width, height)) = parse_viz_open_tag(tag_content) {
+                        self.in_viz_block = true;
+                        self.viz_kind = kind.clone();
+                        self.viz_title = title.clone();
+                        self.viz_width = width;
+                        self.viz_height = height;
+                        self.viz_code_buffer.clear();
+                        commands.push(OverlayCommand::VizLoading { kind, title });
+                        self.just_closed_tag = true;
+                    } else if let Some(cmd) = parse_tag(tag_content) {
                         commands.push(cmd);
                         self.just_closed_tag = true;
                     } else {
@@ -97,7 +174,7 @@ impl TagStreamParser {
                     }
                     self.tag_buffer.clear();
                     self.is_in_tag = false;
-                } else if self.tag_buffer.len() > 512 {
+                } else if self.tag_buffer.len() > MAX_INLINE_TAG_BYTES {
                     // Tag too long without closing bracket, abort and flush as text
                     clean_text.push_str(&self.tag_buffer);
                     self.last_char_was_space = self.tag_buffer.ends_with(' ');
@@ -128,6 +205,13 @@ impl TagStreamParser {
         let mut clean_text = String::new();
         let mut commands = Vec::new();
 
+        if self.in_viz_block {
+            if let Some(cmd) = self.finalize_viz_block() {
+                commands.push(cmd);
+            }
+            return (clean_text, commands);
+        }
+
         if self.is_in_tag && !self.tag_buffer.is_empty() {
             let tag_content = self.tag_buffer.trim_matches(|c| c == '[' || c == ']');
             if let Some(cmd) = parse_tag(tag_content) {
@@ -141,6 +225,80 @@ impl TagStreamParser {
 
         (clean_text, commands)
     }
+}
+
+fn ends_with_viz_close(s: &str) -> bool {
+    let len = s.len();
+    len >= 6
+        && s.is_char_boundary(len - 6)
+        && s[len - 6..].eq_ignore_ascii_case("[/viz]")
+}
+
+fn strip_outer_code_fence(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Some(after_open) = trimmed.strip_prefix("```") {
+        let body = match after_open.find('\n') {
+            Some(idx) => &after_open[idx + 1..],
+            None => after_open,
+        };
+        let body_trimmed = body.trim_end();
+        let stripped = body_trimmed.strip_suffix("```").unwrap_or(body_trimmed);
+        stripped.trim().to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn parse_dimensions(raw: &str) -> Option<(u32, u32)> {
+    let trimmed = raw.trim();
+    let (w_str, h_str) = trimmed
+        .split_once('x')
+        .or_else(|| trimmed.split_once('X'))?;
+    let w = w_str.trim().parse::<u32>().ok()?;
+    let h = h_str.trim().parse::<u32>().ok()?;
+    if w > 0 && h > 0 {
+        Some((w, h))
+    } else {
+        None
+    }
+}
+
+fn parse_viz_open_tag(content: &str) -> Option<(String, String, Option<u32>, Option<u32>)> {
+    let parts: Vec<&str> = content.split(':').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    if !parts[0].trim().eq_ignore_ascii_case("VIZ") {
+        return None;
+    }
+
+    let kind = parts[1].trim().to_lowercase();
+    match kind.as_str() {
+        "html" | "canvas" | "svg" | "mermaid" | "three" | "chart" => {}
+        _ => return None,
+    }
+
+    let (title, width, height) = if parts.len() >= 4 {
+        if let Some((w, h)) = parse_dimensions(parts[parts.len() - 1]) {
+            let t = parts[2..parts.len() - 1].join(":").trim().to_string();
+            (t, Some(w), Some(h))
+        } else {
+            let t = parts[2..].join(":").trim().to_string();
+            (t, None, None)
+        }
+    } else if parts.len() == 3 {
+        (parts[2].trim().to_string(), None, None)
+    } else {
+        (String::new(), None, None)
+    };
+
+    let final_title = if title.is_empty() {
+        "Visualization".to_string()
+    } else {
+        title
+    };
+
+    Some((kind, final_title, width, height))
 }
 
 fn parse_color_and_label_slice(tail: &[&str]) -> (Option<String>, Option<String>) {
@@ -258,7 +416,16 @@ fn parse_tag(content: &str) -> Option<OverlayCommand> {
             if parts.len() >= 3 {
                 let shape = parts[1].trim().to_lowercase();
                 match shape.as_str() {
-                    "line" | "arrow" | "curve" | "polygon" | "circle" | "box" | "text" => {}
+                    "line"
+                    | "dashed"
+                    | "arrow"
+                    | "curve"
+                    | "polygon"
+                    | "polyline"
+                    | "circle"
+                    | "ellipse"
+                    | "box"
+                    | "text" => {}
                     _ => return None,
                 }
 
@@ -326,6 +493,16 @@ fn parse_tag(content: &str) -> Option<OverlayCommand> {
             } else {
                 None
             }
+        }
+        "VIZ" => {
+            // [VIZ:close] or [VIZ:clear]
+            if parts.len() >= 2 {
+                let action = parts[1].trim();
+                if action.eq_ignore_ascii_case("close") || action.eq_ignore_ascii_case("clear") {
+                    return Some(OverlayCommand::VizClose);
+                }
+            }
+            None
         }
         "STEP" => {
             // [STEP:idx/total:x1,y1,x2,y2:instruction]
@@ -731,5 +908,168 @@ mod tests {
                 label: Some("Connect".to_string()),
             }
         );
+    }
+
+    #[test]
+    fn test_viz_block_streaming_and_speech_clean() {
+        let mut parser = TagStreamParser::new();
+        let tokens = vec![
+            "Here is ",
+            "how spring physics compares to easing. ",
+            "[VI",
+            "Z:html:Spring vs Easing:600x440]",
+            "\n```html\n<div class=\"card\">",
+            "const pts = [1, 2, 3]; // arrow → curve\n",
+            "<canvas id=\"c\"></canvas></div>\n```\n",
+            "[/V",
+            "IZ]",
+            " Try dragging the controls!",
+        ];
+
+        let mut all_clean = String::new();
+        let mut all_cmds = Vec::new();
+        let mut saw_loading_before_close = false;
+
+        for (idx, t) in tokens.iter().enumerate() {
+            let (clean, cmds) = parser.feed_token(t);
+            all_clean.push_str(&clean);
+            if idx == 3 {
+                saw_loading_before_close = cmds.iter().any(|c| {
+                    matches!(
+                        c,
+                        OverlayCommand::VizLoading { kind, title }
+                            if kind == "html" && title == "Spring vs Easing"
+                    )
+                });
+            }
+            all_cmds.extend(cmds);
+        }
+        let (clean, cmds) = parser.flush();
+        all_clean.push_str(&clean);
+        all_cmds.extend(cmds);
+
+        assert!(saw_loading_before_close, "VizLoading must emit immediately on opening tag");
+        assert_eq!(
+            all_clean,
+            "Here is how spring physics compares to easing. Try dragging the controls!"
+        );
+        assert_eq!(all_cmds.len(), 2);
+        assert_eq!(
+            all_cmds[0],
+            OverlayCommand::VizLoading {
+                kind: "html".to_string(),
+                title: "Spring vs Easing".to_string(),
+            }
+        );
+        match &all_cmds[1] {
+            OverlayCommand::VizRender {
+                id,
+                kind,
+                title,
+                code,
+                width,
+                height,
+            } => {
+                assert!(!id.is_empty());
+                assert_eq!(kind, "html");
+                assert_eq!(title, "Spring vs Easing");
+                assert_eq!(*width, Some(600));
+                assert_eq!(*height, Some(440));
+                assert!(!code.contains("```"));
+                assert_eq!(
+                    code,
+                    "<div class=\"card\">const pts = [1, 2, 3]; // arrow → curve\n<canvas id=\"c\"></canvas></div>"
+                );
+            }
+            other => panic!("Expected VizRender, got {:?}", other),
+        }
+
+        // Also verify flush() emits VizRender if stream ends without [/VIZ]
+        let mut unclosed_parser = TagStreamParser::new();
+        let (c1, cmds1) = unclosed_parser.feed_token("Check this diagram. [VIZ:mermaid:Flow]\ngraph LR\nA[Start] --> B[Done]");
+        let (c2, cmds2) = unclosed_parser.flush();
+        assert_eq!(format!("{}{}", c1, c2), "Check this diagram. ");
+        assert_eq!(cmds1.len(), 1);
+        assert_eq!(cmds2.len(), 1);
+        match &cmds2[0] {
+            OverlayCommand::VizRender {
+                kind,
+                title,
+                code,
+                width,
+                height,
+                ..
+            } => {
+                assert_eq!(kind, "mermaid");
+                assert_eq!(title, "Flow");
+                assert_eq!(code, "graph LR\nA[Start] --> B[Done]");
+                assert_eq!(*width, None);
+                assert_eq!(*height, None);
+            }
+            other => panic!("Expected VizRender on flush, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_extended_draw_shapes_dashed_ellipse_polyline() {
+        let mut parser = TagStreamParser::new();
+        let input = concat!(
+            "Watch ",
+            "[DRAW:dashed:100,200,500,200:#f59e0b:Baseline] ",
+            "[DRAW:ellipse:500,400,120,70:#38bdf8:Orbit] ",
+            "[DRAW:polyline:100,400,200,320,300,360,400,220:#10b981:Trend] ",
+            "[VIZ:close] ",
+            "[VIZ:CLEAR] ",
+            "done."
+        );
+        let (clean, cmds) = parser.feed_token(input);
+        assert_eq!(clean, "Watch done.");
+        assert_eq!(cmds.len(), 5);
+
+        assert_eq!(
+            cmds[0],
+            OverlayCommand::Draw {
+                shape: "dashed".to_string(),
+                coords: vec![100, 200, 500, 200],
+                color: Some("#f59e0b".to_string()),
+                label: Some("Baseline".to_string()),
+            }
+        );
+        assert_eq!(
+            cmds[1],
+            OverlayCommand::Draw {
+                shape: "ellipse".to_string(),
+                coords: vec![500, 400, 120, 70],
+                color: Some("#38bdf8".to_string()),
+                label: Some("Orbit".to_string()),
+            }
+        );
+        assert_eq!(
+            cmds[2],
+            OverlayCommand::Draw {
+                shape: "polyline".to_string(),
+                coords: vec![100, 400, 200, 320, 300, 360, 400, 220],
+                color: Some("#10b981".to_string()),
+                label: Some("Trend".to_string()),
+            }
+        );
+        assert_eq!(cmds[3], OverlayCommand::VizClose);
+        assert_eq!(cmds[4], OverlayCommand::VizClose);
+
+        // Verify extended 2048-byte inline tag buffer accepts >512-byte polylines
+        let many_coords: Vec<String> = (0..100).map(|i| format!("{},{}", i * 10, 500 - i * 3)).collect();
+        let long_polyline = format!("[DRAW:polyline:{}:#10b981:DenseWave]", many_coords.join(","));
+        assert!(long_polyline.len() > 512 && long_polyline.len() < 2048);
+        let mut long_parser = TagStreamParser::new();
+        let (long_clean, long_cmds) = long_parser.feed_token(&format!("Wave {} ready.", long_polyline));
+        assert_eq!(long_clean, "Wave ready.");
+        assert_eq!(long_cmds.len(), 1);
+        match &long_cmds[0] {
+            OverlayCommand::Draw { shape, coords, .. } => {
+                assert_eq!(shape, "polyline");
+                assert_eq!(coords.len(), 200);
+            }
+            other => panic!("Expected long polyline Draw, got {:?}", other),
+        }
     }
 }

@@ -251,6 +251,8 @@ pub fn run() {
             commands::confirm_drive,
             commands::stop_drive,
             commands::set_ignore_cursor_events,
+            commands::clear_overlay,
+            commands::trigger_overlay_demo,
             commands::get_agents,
             commands::list_agents,
             commands::create_agent,

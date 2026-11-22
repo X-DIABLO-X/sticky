@@ -21,6 +21,7 @@
     "cmdk": "^1.1.1",
     "framer-motion": "^14.14.0",
     "lucide-react": "^1.72.0",
+    "mermaid": "^12.3.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "roughjs": "^4.6.6",

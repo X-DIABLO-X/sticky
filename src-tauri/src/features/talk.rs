@@ -97,7 +97,9 @@ enum ElementResolution {
 enum BroadcastOutcome {
     None,
     PointResolved(u32),
+    RawPointEmitted,
     DrawEmitted,
+    VizEmitted,
 }
 
 fn resolve_element<'a>(
@@ -250,10 +252,15 @@ fn broadcast_overlay_command(
                     let r = (w.max(h) / 2 + 8).clamp(14, 120);
                     vec![el.center_norm[0], el.center_norm[1], r]
                 }
+                "ellipse" => {
+                    let rx = ((el.bbox_norm[2] - el.bbox_norm[0]).abs() / 2 + 8).clamp(14, 140);
+                    let ry = ((el.bbox_norm[3] - el.bbox_norm[1]).abs() / 2 + 8).clamp(14, 140);
+                    vec![el.center_norm[0], el.center_norm[1], rx, ry]
+                }
                 "text" => {
                     vec![el.center_norm[0], (el.bbox_norm[1] - 18).max(12)]
                 }
-                "arrow" | "line" => {
+                "arrow" | "line" | "dashed" => {
                     if let Some(target_id) = target_element_id {
                         let Some(el2) = element_map.get(target_id) else {
                             emit_activity_log(
@@ -336,12 +343,15 @@ fn broadcast_overlay_command(
                 screen: screen.clone(),
             };
             let _ = app.emit("overlay:command", &mapped);
-            BroadcastOutcome::None
+            BroadcastOutcome::RawPointEmitted
         }
         OverlayCommand::Draw { shape, coords, color, label } => {
             let mapped_coords = if shape == "circle" && coords.len() >= 3 {
                 let (ox, oy) = ScreenCaptureService::monitor_to_overlay_norm(coords[0], coords[1], 0);
                 vec![ox, oy, coords[2]]
+            } else if shape == "ellipse" && coords.len() >= 4 {
+                let (ox, oy) = ScreenCaptureService::monitor_to_overlay_norm(coords[0], coords[1], 0);
+                vec![ox, oy, coords[2], coords[3]]
             } else {
                 let mut out = Vec::with_capacity(coords.len());
                 let mut i = 0;
@@ -377,7 +387,21 @@ fn broadcast_overlay_command(
             let _ = app.emit("overlay:command", &mapped);
             BroadcastOutcome::None
         }
-        OverlayCommand::Model3D { .. } | OverlayCommand::ClearDrawings => {
+        OverlayCommand::VizLoading { .. } | OverlayCommand::Model3D { .. } => {
+            let _ = app.emit("overlay:command", cmd);
+            BroadcastOutcome::VizEmitted
+        }
+        OverlayCommand::VizRender { kind, title, .. } => {
+            emit_activity_log(
+                app,
+                "overlay",
+                "Visualization Rendered",
+                &format!("[{}] {}", kind, title),
+            );
+            let _ = app.emit("overlay:command", cmd);
+            BroadcastOutcome::VizEmitted
+        }
+        OverlayCommand::VizClose | OverlayCommand::ClearDrawings => {
             let _ = app.emit("overlay:command", cmd);
             BroadcastOutcome::None
         }
@@ -503,7 +527,9 @@ impl TalkController {
             }
         };
 
-        // Cancel any active step-by-step guide loop when the user starts a new voice query
+        // Cancel any active step-by-step guide loop when the user starts a new voice query.
+        // Intentionally preserve active drawings/visualizations across follow-up turns;
+        // only [DRAW:clear], [VIZ:close], or Esc dismisses them.
         if self.guide_active.swap(false, Ordering::SeqCst) {
             emit_guide_state(&self.app_handle, false, 0, "", "");
         }
@@ -752,7 +778,9 @@ impl TalkController {
         let mut parser = TagStreamParser::new();
         let mut full_reply = String::new();
         let mut guide_signal: Option<bool> = None;
+        let mut emitted_point = false;
         let mut emitted_draw = false;
+        let mut emitted_viz = false;
         let mut last_pointed_element_id: Option<u32> = None;
 
         while let Some(chunk_res) = rx.recv().await {
@@ -773,10 +801,17 @@ impl TalkController {
                                 match broadcast_overlay_command(&self.app_handle, &cmd, &element_map)
                                 {
                                     BroadcastOutcome::PointResolved(id) => {
+                                        emitted_point = true;
                                         last_pointed_element_id = Some(id);
+                                    }
+                                    BroadcastOutcome::RawPointEmitted => {
+                                        emitted_point = true;
                                     }
                                     BroadcastOutcome::DrawEmitted => {
                                         emitted_draw = true;
+                                    }
+                                    BroadcastOutcome::VizEmitted => {
+                                        emitted_viz = true;
                                     }
                                     BroadcastOutcome::None => {}
                                 }
@@ -822,10 +857,17 @@ impl TalkController {
             } else {
                 match broadcast_overlay_command(&self.app_handle, &cmd, &element_map) {
                     BroadcastOutcome::PointResolved(id) => {
+                        emitted_point = true;
                         last_pointed_element_id = Some(id);
+                    }
+                    BroadcastOutcome::RawPointEmitted => {
+                        emitted_point = true;
                     }
                     BroadcastOutcome::DrawEmitted => {
                         emitted_draw = true;
+                    }
+                    BroadcastOutcome::VizEmitted => {
+                        emitted_viz = true;
                     }
                     BroadcastOutcome::None => {}
                 }
@@ -841,7 +883,11 @@ impl TalkController {
                     color: Some("#10b981".to_string()),
                     label: None,
                 };
-                broadcast_overlay_command(&self.app_handle, &auto_box, &element_map);
+                if broadcast_overlay_command(&self.app_handle, &auto_box, &element_map)
+                    == BroadcastOutcome::DrawEmitted
+                {
+                    emitted_draw = true;
+                }
             }
         }
         {
@@ -917,8 +963,20 @@ impl TalkController {
             if guide_signal == Some(false) {
                 self.guide_active.store(false, Ordering::SeqCst);
                 emit_guide_state(&self.app_handle, false, 0, "", "");
-                let _ = self.app_handle.emit("overlay:point_clear", ());
-                let _ = self.app_handle.emit("overlay:clear_drawings", ());
+                // Do NOT emit overlay:clear_drawings or overlay:point_clear here:
+                // a standalone turn with [DRAW:...]/[POINT:...]/[VIZ:...] + [GUIDE:done]
+                // must keep its visuals visible on screen.
+                if emitted_point || emitted_draw || emitted_viz {
+                    emit_activity_log(
+                        &self.app_handle,
+                        "overlay",
+                        "Overlay Visuals Active",
+                        &format!(
+                            "Keeping overlay active (point={}, draw={}, viz={}).",
+                            emitted_point, emitted_draw, emitted_viz
+                        ),
+                    );
+                }
             }
             emit_activity_log(&self.app_handle, "talk", "Ready (Idle)", "Voice pipeline returned to standby.");
             let app_hide = self.app_handle.clone();
@@ -1219,6 +1277,7 @@ impl TalkController {
         let mut full_reply = String::new();
         let mut guide_signal: Option<bool> = None;
         let mut emitted_draw = false;
+        let mut emitted_viz = false;
         let mut last_pointed_element_id: Option<u32> = None;
 
         while let Some(chunk_res) = rx.recv().await {
@@ -1247,8 +1306,12 @@ impl TalkController {
                                     BroadcastOutcome::PointResolved(id) => {
                                         last_pointed_element_id = Some(id);
                                     }
+                                    BroadcastOutcome::RawPointEmitted => {}
                                     BroadcastOutcome::DrawEmitted => {
                                         emitted_draw = true;
+                                    }
+                                    BroadcastOutcome::VizEmitted => {
+                                        emitted_viz = true;
                                     }
                                     BroadcastOutcome::None => {}
                                 }
@@ -1303,8 +1366,12 @@ impl TalkController {
                         BroadcastOutcome::PointResolved(id) => {
                             last_pointed_element_id = Some(id);
                         }
+                        BroadcastOutcome::RawPointEmitted => {}
                         BroadcastOutcome::DrawEmitted => {
                             emitted_draw = true;
+                        }
+                        BroadcastOutcome::VizEmitted => {
+                            emitted_viz = true;
                         }
                         BroadcastOutcome::None => {}
                     }
@@ -1323,7 +1390,11 @@ impl TalkController {
                         color: Some("#10b981".to_string()),
                         label: None,
                     };
-                    broadcast_overlay_command(&self.app_handle, &auto_box, &element_map);
+                    if broadcast_overlay_command(&self.app_handle, &auto_box, &element_map)
+                        == BroadcastOutcome::DrawEmitted
+                    {
+                        emitted_draw = true;
+                    }
                 }
             }
             {
@@ -1387,8 +1458,10 @@ impl TalkController {
         } else {
             self.guide_active.store(false, Ordering::SeqCst);
             emit_guide_state(&self.app_handle, false, 0, "", "");
-            let _ = self.app_handle.emit("overlay:point_clear", ());
-            let _ = self.app_handle.emit("overlay:clear_drawings", ());
+            if !emitted_draw && !emitted_viz {
+                let _ = self.app_handle.emit("overlay:point_clear", ());
+                let _ = self.app_handle.emit("overlay:clear_drawings", ());
+            }
             emit_activity_log(
                 &self.app_handle,
                 "talk",

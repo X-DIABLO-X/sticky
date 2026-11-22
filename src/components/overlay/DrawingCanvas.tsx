@@ -1,11 +1,17 @@
 import React, { useEffect, useRef, useState, useCallback } from "react";
+import rough from "roughjs";
+import { Pencil, Sparkles, Trash2 } from "lucide-react";
 import type { OverlayDrawEvent } from "../../types/events";
 import { listenEvent, setIgnoreCursorEvents } from "../../lib/ipc";
+
+type RoughCanvasInstance = ReturnType<typeof rough.canvas>;
+type RoughDrawOptions = NonNullable<Parameters<RoughCanvasInstance["line"]>[4]>;
 
 interface DrawingItem extends OverlayDrawEvent {
   id: string;
   createdAt: number;
   opacity: number;
+  seed: number;
 }
 
 interface DrawingCanvasProps {
@@ -14,6 +20,91 @@ interface DrawingCanvasProps {
   guidedMode?: boolean;
   onScribbleFocusCrop?: (bbox: [number, number, number, number]) => void;
   onClearAll?: () => void;
+  onRegisterToolbarRect?: (rect: DOMRect | null) => void;
+}
+
+/**
+ * Deterministic positive 31-bit seed from an item's ID so Rough.js strokes
+ * never jitter between 60fps animation frames (Rough.js treats seed 0 as random).
+ */
+function hashIdToSeed(id: string): number {
+  let hash = 2166136261;
+  for (let i = 0; i < id.length; i++) {
+    hash ^= id.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return ((hash >>> 0) % 2147483646) + 1;
+}
+
+/**
+ * Convert a hex or rgb() color string to rgba() with the requested alpha.
+ */
+function colorWithAlpha(color: string, alpha: number): string {
+  const trimmed = color.trim();
+  if (trimmed.startsWith("#")) {
+    const hex = trimmed.slice(1);
+    if (hex.length === 3) {
+      const r = parseInt(hex[0] + hex[0], 16);
+      const g = parseInt(hex[1] + hex[1], 16);
+      const b = parseInt(hex[2] + hex[2], 16);
+      if (!Number.isNaN(r) && !Number.isNaN(g) && !Number.isNaN(b)) {
+        return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+      }
+    } else if (hex.length === 6 || hex.length === 8) {
+      const r = parseInt(hex.slice(0, 2), 16);
+      const g = parseInt(hex.slice(2, 4), 16);
+      const b = parseInt(hex.slice(4, 6), 16);
+      if (!Number.isNaN(r) && !Number.isNaN(g) && !Number.isNaN(b)) {
+        return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+      }
+    }
+  }
+  const rgbMatch = trimmed.match(/^rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)/i);
+  if (rgbMatch) {
+    return `rgba(${rgbMatch[1]}, ${rgbMatch[2]}, ${rgbMatch[3]}, ${alpha})`;
+  }
+  return color;
+}
+
+/**
+ * Slice a polyline smoothly to fraction `t` (0..1) of its total arc length.
+ */
+function slicePolylineByProgress(
+  points: Array<[number, number]>,
+  t: number
+): Array<[number, number]> {
+  if (points.length < 2 || t >= 0.999) return points;
+  if (t <= 0) return [points[0]];
+
+  let totalLen = 0;
+  const segLens: number[] = [];
+  for (let i = 1; i < points.length; i++) {
+    const len = Math.hypot(
+      points[i][0] - points[i - 1][0],
+      points[i][1] - points[i - 1][1]
+    );
+    segLens.push(len);
+    totalLen += len;
+  }
+  if (totalLen <= 0.001) return points;
+
+  const targetLen = totalLen * t;
+  const out: Array<[number, number]> = [points[0]];
+  let accum = 0;
+  for (let i = 0; i < segLens.length; i++) {
+    const segLen = segLens[i];
+    if (accum + segLen >= targetLen) {
+      const remain = targetLen - accum;
+      const frac = segLen > 0 ? remain / segLen : 0;
+      const p0 = points[i];
+      const p1 = points[i + 1];
+      out.push([p0[0] + (p1[0] - p0[0]) * frac, p0[1] + (p1[1] - p0[1]) * frac]);
+      break;
+    }
+    accum += segLen;
+    out.push(points[i + 1]);
+  }
+  return out;
 }
 
 /**
@@ -104,19 +195,68 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
   guidedMode = false,
   onScribbleFocusCrop,
   onClearAll,
+  onRegisterToolbarRect,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const roughCanvasRef = useRef<RoughCanvasInstance | null>(null);
+  const toolbarRef = useRef<HTMLDivElement | null>(null);
+
   const [items, setItems] = useState<DrawingItem[]>([]);
+  const [sketchMode, setSketchMode] = useState(true);
   const [isShiftDown, setIsShiftDown] = useState(false);
   const [isDrawing, setIsDrawing] = useState(false);
+
   const scribblePointsRef = useRef<Array<{ x: number; y: number }>>([]);
   const seenIdsRef = useRef<Set<string>>(new Set());
   const itemsRef = useRef<DrawingItem[]>(items);
   itemsRef.current = items;
+  const sketchModeRef = useRef<boolean>(sketchMode);
+  sketchModeRef.current = sketchMode;
+  const userToggledStyleRef = useRef<boolean>(false);
   const guidedModeRef = useRef<boolean>(guidedMode);
   guidedModeRef.current = guidedMode;
 
-  // Sync external drawings (seenIdsRef prevents zombie resurrection of already-faded drawings!)
+  const handleClearDrawings = useCallback(() => {
+    seenIdsRef.current.clear();
+    setItems([]);
+    onClearAll?.();
+  }, [onClearAll]);
+
+  const handleToggleSketchMode = useCallback(() => {
+    userToggledStyleRef.current = true;
+    setSketchMode((prev) => !prev);
+  }, []);
+
+  // Report floating toolbar DOMRect to OverlayWindow for automatic click-through toggling
+  useEffect(() => {
+    if (!onRegisterToolbarRect) return;
+
+    if (items.length === 0) {
+      onRegisterToolbarRect(null);
+      return;
+    }
+
+    const updateRect = () => {
+      const el = toolbarRef.current;
+      onRegisterToolbarRect(el ? el.getBoundingClientRect() : null);
+    };
+
+    const rafId = requestAnimationFrame(updateRect);
+    window.addEventListener("resize", updateRect);
+    return () => {
+      cancelAnimationFrame(rafId);
+      window.removeEventListener("resize", updateRect);
+    };
+  }, [items.length, sketchMode, onRegisterToolbarRect]);
+
+  // Ensure toolbar rect is unregistered on unmount
+  useEffect(() => {
+    return () => {
+      onRegisterToolbarRect?.(null);
+    };
+  }, [onRegisterToolbarRect]);
+
+  // Sync external drawings (seenIdsRef prevents duplicate adds of already-seen IDs)
   useEffect(() => {
     if (!externalDrawings || externalDrawings.length === 0) return;
 
@@ -132,6 +272,7 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
           id,
           createdAt: Date.now(),
           opacity: 1.0,
+          seed: hashIdToSeed(id),
         });
       }
     });
@@ -167,8 +308,7 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
         setIsShiftDown(true);
         setIgnoreCursorEvents(false);
       } else if (e.key === "Escape") {
-        setItems([]);
-        onClearAll?.();
+        handleClearDrawings();
       }
     };
 
@@ -187,12 +327,13 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
       window.removeEventListener("keydown", handleKeyDown);
       window.removeEventListener("keyup", handleKeyUp);
     };
-  }, [isShiftDown, isDrawing, onClearAll]);
+  }, [isShiftDown, isDrawing, handleClearDrawings]);
 
   // Resize canvas to crisp HiDPI physical resolution
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
+    roughCanvasRef.current = rough.canvas(canvas);
 
     const updateSize = () => {
       const dpr = window.devicePixelRatio || 1;
@@ -209,15 +350,19 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
     return () => window.removeEventListener("resize", updateSize);
   }, []);
 
-  // Expressive Vector Whiteboard rendering loop (all 7 primitives + auto-fade + Shift-scribble)
+  // Expressive Whiteboard rendering loop (Rough.js Sketch + Clean Neon Vector across all 10 primitives)
   const render = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
+    const rc = roughCanvasRef.current ?? (roughCanvasRef.current = rough.canvas(canvas));
+
+    const dpr = window.devicePixelRatio || 1;
     const vw = window.innerWidth;
     const vh = window.innerHeight;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, vw, vh);
     const now = Date.now();
 
@@ -227,35 +372,54 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
     const sr = (v: number) => (v <= 1000 ? (v / 1000) * Math.min(vw, vh) : v);
 
     const activeItems = itemsRef.current;
-    const isGuided = guidedModeRef.current;
+    const globalSketch = sketchModeRef.current;
+    const userForcedStyle = userToggledStyleRef.current;
+
     for (let idx = 0; idx < activeItems.length; idx++) {
       const item = activeItems[idx];
       const age = now - item.createdAt;
       const fadeDuration = item.fadeMs ?? 14000;
-      const stayPersistent = Boolean(item.persistent) || isGuided;
+      // Persist by default; only fade items explicitly marked persistent === false
+      const stayPersistent = item.persistent !== false;
       let alpha = 1.0;
 
-      if (!stayPersistent && age > fadeDuration - 2000) {
-        alpha = Math.max(0, 1 - (age - (fadeDuration - 2000)) / 2000);
+      if (!stayPersistent) {
+        const fadeWindow = Math.min(2000, fadeDuration);
+        if (fadeWindow > 0 && age > fadeDuration - fadeWindow) {
+          alpha = Math.max(0, 1 - (age - (fadeDuration - fadeWindow)) / fadeWindow);
+        }
       }
       if (alpha <= 0) continue;
 
-      // Smooth 280ms ease-out draw-in progress
-      const rawT = Math.min(1, Math.max(0, age / 280));
+      // Smooth 320ms ease-out draw-in progress
+      const rawT = Math.min(1, Math.max(0, age / 320));
       const drawT = 1 - Math.pow(1 - rawT, 3);
 
       const stroke = item.color || "#10b981";
       const coords = item.coords || [];
+      const useSketch = userForcedStyle
+        ? globalSketch
+        : item.style
+          ? item.style === "sketch"
+          : globalSketch;
+
+      const roughBaseOpts: RoughDrawOptions = {
+        seed: item.seed,
+        roughness: 1.35,
+        bowing: 1.1,
+        stroke,
+        strokeWidth: 2.6,
+      };
 
       ctx.save();
       ctx.globalAlpha = alpha * Math.min(1, drawT * 1.4);
       ctx.strokeStyle = stroke;
       ctx.fillStyle = stroke;
-      ctx.lineWidth = 2.5;
+      ctx.lineWidth = useSketch ? 2.6 : 2.5;
       ctx.lineCap = "round";
       ctx.lineJoin = "round";
       ctx.shadowColor = stroke;
-      ctx.shadowBlur = 10;
+      ctx.shadowBlur = useSketch ? 4 : 10;
 
       if (item.shape === "line" && coords.length >= 4) {
         const x1 = sx(coords[0]);
@@ -263,10 +427,35 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
         const x2 = x1 + (sx(coords[2]) - x1) * drawT;
         const y2 = y1 + (sy(coords[3]) - y1) * drawT;
 
-        ctx.beginPath();
-        ctx.moveTo(x1, y1);
-        ctx.lineTo(x2, y2);
-        ctx.stroke();
+        if (useSketch) {
+          rc.line(x1, y1, x2, y2, roughBaseOpts);
+        } else {
+          ctx.beginPath();
+          ctx.moveTo(x1, y1);
+          ctx.lineTo(x2, y2);
+          ctx.stroke();
+        }
+      } else if (item.shape === "dashed" && coords.length >= 4) {
+        const x1 = sx(coords[0]);
+        const y1 = sy(coords[1]);
+        const x2 = x1 + (sx(coords[2]) - x1) * drawT;
+        const y2 = y1 + (sy(coords[3]) - y1) * drawT;
+
+        if (useSketch) {
+          rc.line(x1, y1, x2, y2, {
+            ...roughBaseOpts,
+            strokeLineDash: [8, 6],
+            disableMultiStroke: true,
+          });
+        } else {
+          ctx.save();
+          ctx.setLineDash([8, 6]);
+          ctx.beginPath();
+          ctx.moveTo(x1, y1);
+          ctx.lineTo(x2, y2);
+          ctx.stroke();
+          ctx.restore();
+        }
       } else if (item.shape === "arrow" && coords.length >= 4) {
         const x1 = sx(coords[0]);
         const y1 = sy(coords[1]);
@@ -280,10 +469,14 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
         const shaftEndX = dist > trim ? x2 - trim * Math.cos(angle) : x2;
         const shaftEndY = dist > trim ? y2 - trim * Math.sin(angle) : y2;
 
-        ctx.beginPath();
-        ctx.moveTo(x1, y1);
-        ctx.lineTo(shaftEndX, shaftEndY);
-        ctx.stroke();
+        if (useSketch) {
+          rc.line(x1, y1, shaftEndX, shaftEndY, roughBaseOpts);
+        } else {
+          ctx.beginPath();
+          ctx.moveTo(x1, y1);
+          ctx.lineTo(shaftEndX, shaftEndY);
+          ctx.stroke();
+        }
 
         if (drawT > 0.35) {
           drawArrowHead(ctx, x2, y2, angle, stroke, 15);
@@ -304,10 +497,14 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
         const endX = qx1 + (qx2 - qx1) * drawT;
         const endY = qy1 + (qy2 - qy1) * drawT;
 
-        ctx.beginPath();
-        ctx.moveTo(x1, y1);
-        ctx.quadraticCurveTo(qx1, qy1, endX, endY);
-        ctx.stroke();
+        if (useSketch) {
+          rc.path(`M ${x1} ${y1} Q ${qx1} ${qy1} ${endX} ${endY}`, roughBaseOpts);
+        } else {
+          ctx.beginPath();
+          ctx.moveTo(x1, y1);
+          ctx.quadraticCurveTo(qx1, qy1, endX, endY);
+          ctx.stroke();
+        }
 
         if (drawT > 0.35) {
           const tangentAngle = Math.atan2(endY - qy1, endX - qx1);
@@ -315,39 +512,163 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
         }
       } else if (item.shape === "polygon" && coords.length >= 6) {
         const vertexCount = Math.floor(coords.length / 2);
-        ctx.beginPath();
-        ctx.moveTo(sx(coords[0]), sy(coords[1]));
-        for (let i = 1; i < vertexCount; i++) {
-          ctx.lineTo(sx(coords[i * 2]), sy(coords[i * 2 + 1]));
+        const points: Array<[number, number]> = [];
+        let sumX = 0;
+        let sumY = 0;
+        for (let i = 0; i < vertexCount; i++) {
+          const vx = sx(coords[i * 2]);
+          const vy = sy(coords[i * 2 + 1]);
+          points.push([vx, vy]);
+          sumX += vx;
+          sumY += vy;
         }
-        ctx.closePath();
+        const centX = sumX / vertexCount;
+        const centY = sumY / vertexCount;
 
-        // Soft translucent fill
-        ctx.save();
-        ctx.globalAlpha = alpha * 0.16 * drawT;
-        ctx.shadowBlur = 0;
-        ctx.fill();
-        ctx.restore();
+        if (useSketch) {
+          ctx.save();
+          if (drawT < 1) {
+            const s = 0.88 + 0.12 * drawT;
+            ctx.translate(centX, centY);
+            ctx.scale(s, s);
+            ctx.translate(-centX, -centY);
+          }
+          rc.polygon(points, {
+            ...roughBaseOpts,
+            fill: colorWithAlpha(stroke, 0.22),
+            fillStyle: "hachure",
+            fillWeight: 1.2,
+            hachureGap: 10,
+          });
+          ctx.restore();
+        } else {
+          ctx.beginPath();
+          ctx.moveTo(points[0][0], points[0][1]);
+          for (let i = 1; i < points.length; i++) {
+            ctx.lineTo(points[i][0], points[i][1]);
+          }
+          ctx.closePath();
 
-        // Crisp glowing stroke
-        ctx.stroke();
+          ctx.save();
+          ctx.globalAlpha = alpha * 0.16 * drawT;
+          ctx.shadowBlur = 0;
+          ctx.fill();
+          ctx.restore();
+
+          ctx.stroke();
+        }
+      } else if (item.shape === "polyline" && coords.length >= 4) {
+        const vertexCount = Math.floor(coords.length / 2);
+        const allPoints: Array<[number, number]> = [];
+        for (let i = 0; i < vertexCount; i++) {
+          allPoints.push([sx(coords[i * 2]), sy(coords[i * 2 + 1])]);
+        }
+        const visiblePoints = slicePolylineByProgress(allPoints, drawT);
+
+        if (visiblePoints.length >= 2) {
+          if (useSketch) {
+            rc.linearPath(visiblePoints, roughBaseOpts);
+          } else {
+            ctx.beginPath();
+            ctx.moveTo(visiblePoints[0][0], visiblePoints[0][1]);
+            if (visiblePoints.length === 2) {
+              ctx.lineTo(visiblePoints[1][0], visiblePoints[1][1]);
+            } else {
+              for (let i = 1; i < visiblePoints.length - 1; i++) {
+                const midX = (visiblePoints[i][0] + visiblePoints[i + 1][0]) / 2;
+                const midY = (visiblePoints[i][1] + visiblePoints[i + 1][1]) / 2;
+                ctx.quadraticCurveTo(
+                  visiblePoints[i][0],
+                  visiblePoints[i][1],
+                  midX,
+                  midY
+                );
+              }
+              const last = visiblePoints[visiblePoints.length - 1];
+              ctx.lineTo(last[0], last[1]);
+            }
+            ctx.stroke();
+          }
+        }
       } else if (item.shape === "circle" && coords.length >= 3) {
         const cx = sx(coords[0]);
         const cy = sy(coords[1]);
         const r = Math.max(8, sr(coords[2]));
 
-        ctx.beginPath();
-        ctx.arc(cx, cy, r, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * drawT);
-
-        if (drawT >= 0.99) {
+        if (useSketch) {
           ctx.save();
-          ctx.globalAlpha = alpha * 0.1;
-          ctx.shadowBlur = 0;
-          ctx.fill();
+          if (drawT < 1) {
+            const s = 0.85 + 0.15 * drawT;
+            ctx.translate(cx, cy);
+            ctx.scale(s, s);
+            ctx.translate(-cx, -cy);
+          }
+          rc.circle(cx, cy, r * 2, {
+            ...roughBaseOpts,
+            fill: colorWithAlpha(stroke, 0.14),
+            fillStyle: "hachure",
+            fillWeight: 1.2,
+            hachureGap: 11,
+          });
           ctx.restore();
-        }
+        } else {
+          ctx.beginPath();
+          ctx.arc(cx, cy, r, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * drawT);
 
-        ctx.stroke();
+          if (drawT >= 0.99) {
+            ctx.save();
+            ctx.globalAlpha = alpha * 0.1;
+            ctx.shadowBlur = 0;
+            ctx.fill();
+            ctx.restore();
+          }
+
+          ctx.stroke();
+        }
+      } else if (item.shape === "ellipse" && coords.length >= 4) {
+        const cx = sx(coords[0]);
+        const cy = sy(coords[1]);
+        const rx = Math.max(8, sx(coords[2]));
+        const ry = Math.max(8, sy(coords[3]));
+
+        if (useSketch) {
+          ctx.save();
+          if (drawT < 1) {
+            const s = 0.85 + 0.15 * drawT;
+            ctx.translate(cx, cy);
+            ctx.scale(s, s);
+            ctx.translate(-cx, -cy);
+          }
+          rc.ellipse(cx, cy, rx * 2, ry * 2, {
+            ...roughBaseOpts,
+            fill: colorWithAlpha(stroke, 0.14),
+            fillStyle: "hachure",
+            fillWeight: 1.2,
+            hachureGap: 11,
+          });
+          ctx.restore();
+        } else {
+          ctx.beginPath();
+          ctx.ellipse(
+            cx,
+            cy,
+            rx,
+            ry,
+            0,
+            -Math.PI / 2,
+            -Math.PI / 2 + Math.PI * 2 * drawT
+          );
+
+          if (drawT >= 0.99) {
+            ctx.save();
+            ctx.globalAlpha = alpha * 0.1;
+            ctx.shadowBlur = 0;
+            ctx.fill();
+            ctx.restore();
+          }
+
+          ctx.stroke();
+        }
       } else if (item.shape === "box" && coords.length >= 4) {
         const rx1 = sx(coords[0]);
         const ry1 = sy(coords[1]);
@@ -357,28 +678,46 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
         const cy = (ry1 + ry2) / 2;
         const fullW = Math.max(8, Math.abs(rx2 - rx1));
         const fullH = Math.max(8, Math.abs(ry2 - ry1));
-        const scale = 0.85 + 0.15 * drawT;
-        const width = fullW * scale;
-        const height = fullH * scale;
-        const x = cx - width / 2;
-        const y = cy - height / 2;
+        const fullX = Math.min(rx1, rx2);
+        const fullY = Math.min(ry1, ry2);
 
-        ctx.beginPath();
-        if (typeof ctx.roundRect === "function") {
-          ctx.roundRect(x, y, width, height, 8);
+        if (useSketch) {
+          ctx.save();
+          if (drawT < 1) {
+            const s = 0.85 + 0.15 * drawT;
+            ctx.translate(cx, cy);
+            ctx.scale(s, s);
+            ctx.translate(-cx, -cy);
+          }
+          rc.rectangle(fullX, fullY, fullW, fullH, {
+            ...roughBaseOpts,
+            fill: colorWithAlpha(stroke, 0.12),
+            fillStyle: "solid",
+            fillWeight: 1.2,
+          });
+          ctx.restore();
         } else {
-          ctx.rect(x, y, width, height);
+          const scale = 0.85 + 0.15 * drawT;
+          const width = fullW * scale;
+          const height = fullH * scale;
+          const x = cx - width / 2;
+          const y = cy - height / 2;
+
+          ctx.beginPath();
+          if (typeof ctx.roundRect === "function") {
+            ctx.roundRect(x, y, width, height, 8);
+          } else {
+            ctx.rect(x, y, width, height);
+          }
+
+          ctx.save();
+          ctx.globalAlpha = alpha * 0.12 * drawT;
+          ctx.shadowBlur = 0;
+          ctx.fill();
+          ctx.restore();
+
+          ctx.stroke();
         }
-
-        // Soft translucent fill (0.12 alpha)
-        ctx.save();
-        ctx.globalAlpha = alpha * 0.12 * drawT;
-        ctx.shadowBlur = 0;
-        ctx.fill();
-        ctx.restore();
-
-        // Crisp 2.5px glowing stroke
-        ctx.stroke();
       } else if (item.shape === "text" && coords.length >= 2 && item.label) {
         const tx = sx(coords[0]);
         const ty = sy(coords[1]);
@@ -386,7 +725,12 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
       }
 
       // Optional floating label pill for non-text shapes
-      if (item.shape !== "text" && item.label && item.label.trim() && coords.length >= 2) {
+      if (
+        item.shape !== "text" &&
+        item.label &&
+        item.label.trim() &&
+        coords.length >= 2
+      ) {
         let anchorX = sx(coords[0]);
         let topY = sy(coords[1]);
         let bottomY = topY + 16;
@@ -402,7 +746,16 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
           anchorX = sx(coords[0]) - r;
           topY = sy(coords[1]) - r;
           bottomY = sy(coords[1]) + r;
-        } else if (item.shape === "polygon" && coords.length >= 6) {
+        } else if (item.shape === "ellipse" && coords.length >= 4) {
+          const rx = Math.max(8, sx(coords[2]));
+          const ry = Math.max(8, sy(coords[3]));
+          anchorX = sx(coords[0]) - rx;
+          topY = sy(coords[1]) - ry;
+          bottomY = sy(coords[1]) + ry;
+        } else if (
+          (item.shape === "polygon" && coords.length >= 6) ||
+          (item.shape === "polyline" && coords.length >= 4)
+        ) {
           const vertexCount = Math.floor(coords.length / 2);
           let minX = Infinity;
           let minY = Infinity;
@@ -420,7 +773,16 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
         }
 
         const ly = topY >= 44 ? topY - 34 : bottomY + 8;
-        drawLabelPill(ctx, anchorX, ly, item.label.trim(), stroke, alpha * drawT, vw, vh);
+        drawLabelPill(
+          ctx,
+          anchorX,
+          ly,
+          item.label.trim(),
+          stroke,
+          alpha * drawT,
+          vw,
+          vh
+        );
       }
 
       ctx.restore();
@@ -455,12 +817,14 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
     let animId: number;
     const loop = () => {
       render();
-      // Filter out completely faded items without triggering redundant React re-renders
+      // Only prune non-persistent items (persistent !== false stays until explicitly cleared)
       const now = Date.now();
       setItems((prev) => {
-        if (prev.length === 0 || guidedModeRef.current) return prev;
+        if (prev.length === 0) return prev;
         const next = prev.filter(
-          (it) => it.persistent || now - it.createdAt < (it.fadeMs ?? 14000)
+          (it) =>
+            it.persistent !== false ||
+            now - it.createdAt < (it.fadeMs ?? 14000)
         );
         return next.length === prev.length ? prev : next;
       });
@@ -515,11 +879,12 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
         Math.round((maxY / vh) * 1000),
       ];
 
-      // Add a box annotation showing what was captured
+      const cropId = `crop-${Date.now()}`;
+      // Add a temporary auto-fading box annotation showing what was captured
       setItems((prev) => [
         ...prev,
         {
-          id: `crop-${Date.now()}`,
+          id: cropId,
           shape: "box",
           coords: normalizedCoords,
           label: "Focus Crop (Vision Input)",
@@ -527,6 +892,8 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
           createdAt: Date.now(),
           opacity: 1.0,
           fadeMs: 6000,
+          persistent: false,
+          seed: hashIdToSeed(cropId),
         },
       ]);
 
@@ -552,6 +919,66 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
             : "pointer-events-none"
         }`}
       />
+
+      {/* Floating Drawing Controls Mini-Pill */}
+      {items.length > 0 && (
+        <div
+          ref={toolbarRef}
+          onMouseEnter={() => {
+            if (!onRegisterToolbarRect) setIgnoreCursorEvents(false);
+          }}
+          onMouseLeave={() => {
+            if (!onRegisterToolbarRect && !isShiftDown && !isDrawing) {
+              setIgnoreCursorEvents(true);
+            }
+          }}
+          className="fixed bottom-5 left-5 z-50 pointer-events-auto bg-zinc-950/90 border border-emerald-400/40 backdrop-blur-md shadow-2xl rounded-full px-3 py-1.5 flex items-center gap-2 text-xs text-zinc-100 select-none"
+        >
+          <span className="flex items-center gap-1.5 font-medium text-emerald-300 tabular-nums">
+            <span className="w-2 h-2 rounded-full bg-emerald-400" />
+            {items.length} {items.length === 1 ? "drawing" : "drawings"}
+          </span>
+
+          <span className="h-3.5 w-px bg-white/15" />
+
+          <button
+            type="button"
+            onClick={handleToggleSketchMode}
+            title={
+              sketchMode
+                ? "Switch to Clean Neon Vector mode"
+                : "Switch to Hand-Drawn Sketch mode"
+            }
+            className={`flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-semibold transition-colors ${
+              sketchMode
+                ? "bg-amber-500/20 text-amber-200 border border-amber-400/40 hover:bg-amber-500/30"
+                : "bg-emerald-500/20 text-emerald-200 border border-emerald-400/40 hover:bg-emerald-500/30"
+            }`}
+          >
+            {sketchMode ? (
+              <>
+                <Pencil className="w-3 h-3" />
+                Sketch
+              </>
+            ) : (
+              <>
+                <Sparkles className="w-3 h-3" />
+                Neon
+              </>
+            )}
+          </button>
+
+          <button
+            type="button"
+            onClick={handleClearDrawings}
+            title="Clear all drawings (Esc)"
+            className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-semibold bg-rose-500/15 text-rose-200 border border-rose-400/35 hover:bg-rose-500/30 transition-colors"
+          >
+            <Trash2 className="w-3 h-3" />
+            Clear (Esc)
+          </button>
+        </div>
+      )}
 
       {/* Floating hint pill when Shift is held */}
       {isShiftDown && (
