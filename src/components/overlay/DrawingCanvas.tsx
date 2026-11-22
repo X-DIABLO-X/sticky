@@ -56,7 +56,9 @@ function drawLabelPill(
   y: number,
   text: string,
   accentColor: string,
-  alpha: number
+  alpha: number,
+  viewportW: number = window.innerWidth,
+  viewportH: number = window.innerHeight
 ) {
   ctx.save();
   ctx.globalAlpha = alpha;
@@ -66,9 +68,9 @@ function drawLabelPill(
   const pillW = metrics.width + padX * 2;
   const pillH = 26;
 
-  // Clamp inside viewport bounds
-  const px = Math.max(8, Math.min(ctx.canvas.width - pillW - 8, x));
-  const py = Math.max(8, Math.min(ctx.canvas.height - pillH - 8, y));
+  // Clamp inside logical CSS viewport bounds
+  const px = Math.max(8, Math.min(viewportW - pillW - 8, x));
+  const py = Math.max(8, Math.min(viewportH - pillH - 8, y));
 
   ctx.shadowColor = "rgba(0, 0, 0, 0.5)";
   ctx.shadowBlur = 14;
@@ -108,37 +110,41 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
   const [isShiftDown, setIsShiftDown] = useState(false);
   const [isDrawing, setIsDrawing] = useState(false);
   const scribblePointsRef = useRef<Array<{ x: number; y: number }>>([]);
+  const seenIdsRef = useRef<Set<string>>(new Set());
   const itemsRef = useRef<DrawingItem[]>(items);
   itemsRef.current = items;
   const guidedModeRef = useRef<boolean>(guidedMode);
   guidedModeRef.current = guidedMode;
 
-  // Sync external drawings
+  // Sync external drawings (seenIdsRef prevents zombie resurrection of already-faded drawings!)
   useEffect(() => {
     if (!externalDrawings || externalDrawings.length === 0) return;
 
-    setItems((prev) => {
-      const newItems = [...prev];
-      externalDrawings.forEach((d) => {
-        const id =
-          d.id ||
-          `draw-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-        if (!newItems.some((item) => item.id === id)) {
-          newItems.push({
-            ...d,
-            id,
-            createdAt: Date.now(),
-            opacity: 1.0,
-          });
-        }
-      });
-      return newItems;
+    const toAdd: DrawingItem[] = [];
+    externalDrawings.forEach((d) => {
+      const id =
+        d.id ||
+        `draw-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+      if (!seenIdsRef.current.has(id)) {
+        seenIdsRef.current.add(id);
+        toAdd.push({
+          ...d,
+          id,
+          createdAt: Date.now(),
+          opacity: 1.0,
+        });
+      }
     });
+
+    if (toAdd.length > 0) {
+      setItems((prev) => [...prev, ...toAdd]);
+    }
   }, [externalDrawings]);
 
   // Immediately clear drawings when clearSignal increments
   useEffect(() => {
     if (clearSignal > 0) {
+      seenIdsRef.current.clear();
       setItems([]);
     }
   }, [clearSignal]);
@@ -146,6 +152,7 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
   // Listen for backend overlay:clear_drawings event directly
   useEffect(() => {
     const unlistenClear = listenEvent("overlay:clear_drawings", () => {
+      seenIdsRef.current.clear();
       setItems([]);
     });
     return () => {
@@ -182,14 +189,19 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
     };
   }, [isShiftDown, isDrawing, onClearAll]);
 
-  // Resize canvas to match display window
+  // Resize canvas to crisp HiDPI physical resolution
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
     const updateSize = () => {
-      canvas.width = window.innerWidth;
-      canvas.height = window.innerHeight;
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.round(window.innerWidth * dpr);
+      canvas.height = Math.round(window.innerHeight * dpr);
+      const ctx = canvas.getContext("2d");
+      if (ctx) {
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      }
     };
 
     updateSize();
@@ -204,10 +216,9 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-    const vw = canvas.width;
-    const vh = canvas.height;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    ctx.clearRect(0, 0, vw, vh);
     const now = Date.now();
 
     // Scale normalized 0..1000 coords to viewport pixels (pass through if already > 1000)
@@ -371,14 +382,45 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
       } else if (item.shape === "text" && coords.length >= 2 && item.label) {
         const tx = sx(coords[0]);
         const ty = sy(coords[1]);
-        drawLabelPill(ctx, tx, ty, item.label, stroke, alpha * drawT);
+        drawLabelPill(ctx, tx, ty, item.label, stroke, alpha * drawT, vw, vh);
       }
 
       // Optional floating label pill for non-text shapes
       if (item.shape !== "text" && item.label && item.label.trim() && coords.length >= 2) {
-        const lx = sx(coords[0]);
-        const ly = Math.max(8, sy(coords[1]) - 34);
-        drawLabelPill(ctx, lx, ly, item.label.trim(), stroke, alpha * drawT);
+        let anchorX = sx(coords[0]);
+        let topY = sy(coords[1]);
+        let bottomY = topY + 16;
+
+        if (item.shape === "box" && coords.length >= 4) {
+          const y1 = sy(coords[1]);
+          const y2 = sy(coords[3]);
+          anchorX = Math.min(sx(coords[0]), sx(coords[2]));
+          topY = Math.min(y1, y2);
+          bottomY = Math.max(y1, y2);
+        } else if (item.shape === "circle" && coords.length >= 3) {
+          const r = Math.max(8, sr(coords[2]));
+          anchorX = sx(coords[0]) - r;
+          topY = sy(coords[1]) - r;
+          bottomY = sy(coords[1]) + r;
+        } else if (item.shape === "polygon" && coords.length >= 6) {
+          const vertexCount = Math.floor(coords.length / 2);
+          let minX = Infinity;
+          let minY = Infinity;
+          let maxY = -Infinity;
+          for (let i = 0; i < vertexCount; i++) {
+            const vx = sx(coords[i * 2]);
+            const vy = sy(coords[i * 2 + 1]);
+            if (vx < minX) minX = vx;
+            if (vy < minY) minY = vy;
+            if (vy > maxY) maxY = vy;
+          }
+          anchorX = minX;
+          topY = minY;
+          bottomY = maxY;
+        }
+
+        const ly = topY >= 44 ? topY - 34 : bottomY + 8;
+        drawLabelPill(ctx, anchorX, ly, item.label.trim(), stroke, alpha * drawT, vw, vh);
       }
 
       ctx.restore();
@@ -464,8 +506,8 @@ export const DrawingCanvas: React.FC<DrawingCanvasProps> = ({
         Math.round(maxY),
       ];
 
-      const vw = canvasRef.current?.width || window.innerWidth;
-      const vh = canvasRef.current?.height || window.innerHeight;
+      const vw = window.innerWidth || 1;
+      const vh = window.innerHeight || 1;
       const normalizedCoords = [
         Math.round((minX / vw) * 1000),
         Math.round((minY / vh) * 1000),

@@ -17,7 +17,13 @@ pub fn extract_ocr_words(img: &RgbaImage) -> Vec<OcrWord> {
         if img.width() == 0 || img.height() == 0 {
             return Vec::new();
         }
-        extract_ocr_words_winrt(img).unwrap_or_default()
+        match extract_ocr_words_winrt(img) {
+            Ok(words) => words,
+            Err(e) => {
+                eprintln!("[OCR] WinRT OCR failed: {e}");
+                Vec::new()
+            }
+        }
     }
     #[cfg(not(windows))]
     {
@@ -120,7 +126,7 @@ fn extract_ocr_words_winrt(img: &RgbaImage) -> windows::core::Result<Vec<OcrWord
                 let cur_right = current.bbox[0] + current.bbox[2];
                 let gap = next.bbox[0] - cur_right;
                 let max_h = current.bbox[3].max(next.bbox[3]);
-                let merge_threshold = ((max_h as f32) * 0.45).round() as i32;
+                let merge_threshold = ((max_h as f32) * 0.78).round() as i32;
                 let merged_len = current.text.len() + 1 + next.text.len();
 
                 if gap <= merge_threshold && gap >= -(max_h / 2) && merged_len <= 40 {

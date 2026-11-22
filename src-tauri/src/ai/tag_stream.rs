@@ -75,6 +75,14 @@ impl TagStreamParser {
 
         for ch in token.chars() {
             if self.is_in_tag {
+                if ch == '[' {
+                    // Unclosed '[' in prose before a real tag: flush old buffer as prose and start fresh
+                    clean_text.push_str(&self.tag_buffer);
+                    self.last_char_was_space = self.tag_buffer.ends_with(' ');
+                    self.tag_buffer.clear();
+                    self.tag_buffer.push('[');
+                    continue;
+                }
                 self.tag_buffer.push(ch);
                 if ch == ']' {
                     // Closed bracket: parse tag
@@ -135,27 +143,27 @@ impl TagStreamParser {
     }
 }
 
-fn parse_draw_color_and_label(parts: &[&str]) -> (Option<String>, Option<String>) {
+fn parse_color_and_label_slice(tail: &[&str]) -> (Option<String>, Option<String>) {
     let mut color: Option<String> = None;
     let mut label: Option<String> = None;
 
-    if let Some(p3) = parts.get(3) {
-        let trimmed = p3.trim();
+    if let Some(first) = tail.first() {
+        let trimmed = first.trim();
         if trimmed.starts_with('#') {
             color = Some(trimmed.to_string());
-            if parts.len() >= 5 {
-                let lbl = parts[4..].join(":").trim().to_string();
+            if tail.len() >= 2 {
+                let lbl = tail[1..].join(":").trim().to_string();
                 if !lbl.is_empty() {
                     label = Some(lbl);
                 }
             }
         } else if !trimmed.is_empty() {
-            let lbl = parts[3..].join(":").trim().to_string();
+            let lbl = tail.join(":").trim().to_string();
             if !lbl.is_empty() {
                 label = Some(lbl);
             }
-        } else if parts.len() >= 5 {
-            let lbl = parts[4..].join(":").trim().to_string();
+        } else if tail.len() >= 2 {
+            let lbl = tail[1..].join(":").trim().to_string();
             if !lbl.is_empty() {
                 label = Some(lbl);
             }
@@ -165,31 +173,40 @@ fn parse_draw_color_and_label(parts: &[&str]) -> (Option<String>, Option<String>
     (color, label)
 }
 
+fn parse_element_id_token(raw: &str) -> Option<u32> {
+    let trimmed = raw.trim();
+    let digits = trimmed.strip_prefix('#').unwrap_or(trimmed).trim();
+    digits.parse::<u32>().ok()
+}
+
 fn parse_tag(content: &str) -> Option<OverlayCommand> {
     let parts: Vec<&str> = content.split(':').collect();
     if parts.is_empty() {
         return None;
     }
 
-    match parts[0].to_uppercase().as_str() {
+    match parts[0].trim().to_uppercase().as_str() {
         "POINT" => {
-            // [POINT:#12:Add] or [POINT:#12:Add:screen0] or [POINT:#12]
+            // [POINT:#12:Add], [POINT: #12 : Add], [POINT:12:Add], [POINT:#12:Add:screen0], [POINT:#12]
             if parts.len() >= 2 {
                 let target = parts[1].trim();
-                if let Some(id_str) = target.strip_prefix('#') {
-                    if !id_str.contains(',') {
-                        let element_id = id_str.trim().parse::<u32>().ok()?;
-                        let label = parts
-                            .get(2)
-                            .map(|s| s.trim().to_string())
-                            .unwrap_or_default();
-                        let screen = parts.get(3).unwrap_or(&"screen0").trim().to_string();
-                        return Some(OverlayCommand::PointRef {
-                            element_id,
-                            label,
-                            screen,
-                        });
-                    }
+                if !target.contains(',') {
+                    let element_id = parse_element_id_token(target)?;
+                    let label = parts
+                        .get(2)
+                        .map(|s| s.trim().to_string())
+                        .unwrap_or_default();
+                    let screen = parts
+                        .get(3)
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("screen0")
+                        .to_string();
+                    return Some(OverlayCommand::PointRef {
+                        element_id,
+                        label,
+                        screen,
+                    });
                 }
             }
 
@@ -199,16 +216,41 @@ fn parse_tag(content: &str) -> Option<OverlayCommand> {
                 let x = coords.first()?.trim().parse::<i32>().ok()?;
                 let y = coords.get(1)?.trim().parse::<i32>().ok()?;
                 let label = parts[2].trim().to_string();
-                let screen = parts.get(3).unwrap_or(&"screen0").trim().to_string();
+                let screen = parts
+                    .get(3)
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("screen0")
+                    .to_string();
                 Some(OverlayCommand::Point { x, y, label, screen })
             } else {
                 None
             }
         }
+        "HIGHLIGHT" | "BOX" => {
+            // [HIGHLIGHT:#8], [HIGHLIGHT:#8:Add], [HIGHLIGHT:8:Add], [BOX:#8], [BOX:#8:Add]
+            if parts.len() >= 2 {
+                let target = parts[1].trim();
+                if !target.contains(',') {
+                    let element_id = parse_element_id_token(target)?;
+                    let (parsed_color, label) =
+                        parse_color_and_label_slice(parts.get(2..).unwrap_or(&[]));
+                    let color = parsed_color.or_else(|| Some("#10b981".to_string()));
+                    return Some(OverlayCommand::DrawRef {
+                        shape: "box".to_string(),
+                        element_id,
+                        target_element_id: None,
+                        color,
+                        label,
+                    });
+                }
+            }
+            None
+        }
         "DRAW" => {
             // [DRAW:clear]
-            // [DRAW:shape:#12[:#color][:label]]
-            // [DRAW:shape:#12->#24[:#color][:label]]
+            // [DRAW:shape:#12[:#color][:label]] or [DRAW:shape:12[:#color][:label]]
+            // [DRAW:shape:#12->#24[:#color][:label]] or [DRAW:shape:12->24[:#color][:label]]
             // [DRAW:shape:coords[:#color][:label]]
             if parts.len() >= 2 && parts[1].trim().eq_ignore_ascii_case("clear") {
                 return Some(OverlayCommand::ClearDrawings);
@@ -221,17 +263,18 @@ fn parse_tag(content: &str) -> Option<OverlayCommand> {
                 }
 
                 let target_spec = parts[2].trim();
-                if let Some(rest) = target_spec.strip_prefix('#') {
+                if !target_spec.contains(',') {
                     let (element_id, target_element_id) =
-                        if let Some((src, dst)) = rest.split_once("->") {
-                            let id1 = src.trim().parse::<u32>().ok()?;
-                            let id2 = dst.trim().strip_prefix('#')?.trim().parse::<u32>().ok()?;
+                        if let Some((src, dst)) = target_spec.split_once("->") {
+                            let id1 = parse_element_id_token(src)?;
+                            let id2 = parse_element_id_token(dst)?;
                             (id1, Some(id2))
                         } else {
-                            let id1 = rest.trim().parse::<u32>().ok()?;
+                            let id1 = parse_element_id_token(target_spec)?;
                             (id1, None)
                         };
-                    let (color, label) = parse_draw_color_and_label(&parts);
+                    let (color, label) =
+                        parse_color_and_label_slice(parts.get(3..).unwrap_or(&[]));
                     return Some(OverlayCommand::DrawRef {
                         shape,
                         element_id,
@@ -249,7 +292,8 @@ fn parse_tag(content: &str) -> Option<OverlayCommand> {
                     return None;
                 }
 
-                let (color, label) = parse_draw_color_and_label(&parts);
+                let (color, label) =
+                    parse_color_and_label_slice(parts.get(3..).unwrap_or(&[]));
 
                 Some(OverlayCommand::Draw {
                     shape,
@@ -516,11 +560,107 @@ mod tests {
             }
         );
 
-        // Numeric ID without '#' and without ',' must NOT be parsed as PointRef or Point
+        // Non-numeric target without ',' must NOT be parsed as PointRef or Point
         let mut parser2 = TagStreamParser::new();
-        let (clean2, cmds2) = parser2.feed_token("Bad [POINT:12:Add] tag.");
-        assert_eq!(clean2, "Bad [POINT:12:Add] tag.");
+        let (clean2, cmds2) = parser2.feed_token("Bad [POINT:abc:Add] tag.");
+        assert_eq!(clean2, "Bad [POINT:abc:Add] tag.");
         assert!(cmds2.is_empty());
+    }
+
+    #[test]
+    fn test_tolerant_small_model_tags() {
+        let mut parser = TagStreamParser::new();
+        let input = "Click [POINT:8:Add] or [POINT: #8 : Add] then [HIGHLIGHT:#8] [HIGHLIGHT:#8:Add] [BOX:#8] [DRAW:box:8:#10b981] [DRAW:arrow:8->14:#10b981] [DRAW:arrow:#8->14:#10b981:Step] [DRAW:arrow:8->#14:#10b981] done.";
+        let (clean, cmds) = parser.feed_token(input);
+        assert_eq!(clean, "Click or then done.");
+        assert_eq!(cmds.len(), 9);
+
+        assert_eq!(
+            cmds[0],
+            OverlayCommand::PointRef {
+                element_id: 8,
+                label: "Add".to_string(),
+                screen: "screen0".to_string(),
+            }
+        );
+        assert_eq!(
+            cmds[1],
+            OverlayCommand::PointRef {
+                element_id: 8,
+                label: "Add".to_string(),
+                screen: "screen0".to_string(),
+            }
+        );
+        assert_eq!(
+            cmds[2],
+            OverlayCommand::DrawRef {
+                shape: "box".to_string(),
+                element_id: 8,
+                target_element_id: None,
+                color: Some("#10b981".to_string()),
+                label: None,
+            }
+        );
+        assert_eq!(
+            cmds[3],
+            OverlayCommand::DrawRef {
+                shape: "box".to_string(),
+                element_id: 8,
+                target_element_id: None,
+                color: Some("#10b981".to_string()),
+                label: Some("Add".to_string()),
+            }
+        );
+        assert_eq!(
+            cmds[4],
+            OverlayCommand::DrawRef {
+                shape: "box".to_string(),
+                element_id: 8,
+                target_element_id: None,
+                color: Some("#10b981".to_string()),
+                label: None,
+            }
+        );
+        assert_eq!(
+            cmds[5],
+            OverlayCommand::DrawRef {
+                shape: "box".to_string(),
+                element_id: 8,
+                target_element_id: None,
+                color: Some("#10b981".to_string()),
+                label: None,
+            }
+        );
+        assert_eq!(
+            cmds[6],
+            OverlayCommand::DrawRef {
+                shape: "arrow".to_string(),
+                element_id: 8,
+                target_element_id: Some(14),
+                color: Some("#10b981".to_string()),
+                label: None,
+            }
+        );
+        assert_eq!(
+            cmds[7],
+            OverlayCommand::DrawRef {
+                shape: "arrow".to_string(),
+                element_id: 8,
+                target_element_id: Some(14),
+                color: Some("#10b981".to_string()),
+                label: Some("Step".to_string()),
+            }
+        );
+        assert_eq!(
+            cmds[8],
+            OverlayCommand::DrawRef {
+                shape: "arrow".to_string(),
+                element_id: 8,
+                target_element_id: Some(14),
+                color: Some("#10b981".to_string()),
+                label: None,
+            }
+        );
     }
 
     #[test]

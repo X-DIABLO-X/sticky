@@ -122,7 +122,7 @@ export const CursorFollower: React.FC<CursorFollowerProps> = ({
     };
   }, []);
 
-  // Configure Bezier glide + Escape / 12s auto-return whenever aiTarget changes
+  // Configure Bezier glide whenever aiTarget changes (independent of guidedMode so arrival ripple doesn't restart!)
   useEffect(() => {
     if (!aiTarget) {
       glideRef.current.active = false;
@@ -159,20 +159,18 @@ export const CursorFollower: React.FC<CursorFollowerProps> = ({
     };
     window.addEventListener("keydown", handleKeyDown);
 
-    // 12-second auto-return when not in guided walkthrough mode
-    let autoReturnTimer: number | undefined;
-    if (!guidedMode) {
-      autoReturnTimer = window.setTimeout(() => {
-        onClearTarget?.();
-      }, 12000);
-    }
-
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
-      if (autoReturnTimer !== undefined) {
-        window.clearTimeout(autoReturnTimer);
-      }
     };
+  }, [aiTarget, onClearTarget]);
+
+  // Separate auto-return timer when NOT in guided mode (changing guidedMode never restarts the glide!)
+  useEffect(() => {
+    if (!aiTarget || guidedMode) return;
+    const autoReturnTimer = window.setTimeout(() => {
+      onClearTarget?.();
+    }, 12000);
+    return () => window.clearTimeout(autoReturnTimer);
   }, [aiTarget, guidedMode, onClearTarget]);
 
   // Unified 60fps animation loop for both Mode A (user follow) and Mode B (AI pointing)

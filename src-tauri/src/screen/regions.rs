@@ -17,7 +17,8 @@ pub fn detect_icon_regions(
         return Vec::new();
     }
 
-    // 1. Downscale by 2x (2x2 box average) to grayscale for speed (~15-30ms on 1080p release)
+    // 1. Downscale by 2x (2x2 box average) per RGB channel so colored dark-theme icons
+    //    (e.g., green Add Cube, blue Select Box, colorful toolbar buttons) retain full edge contrast.
     let dw = orig_w / 2;
     let dh = orig_h / 2;
     if dw < 8 || dh < 8 {
@@ -25,7 +26,9 @@ pub fn detect_icon_regions(
     }
 
     let raw = img.as_raw();
-    let mut gray = vec![0u8; dw * dh];
+    let mut ch_r = vec![0u8; dw * dh];
+    let mut ch_g = vec![0u8; dw * dh];
+    let mut ch_b = vec![0u8; dw * dh];
     for y in 0..dh {
         let sy = y * 2;
         let row0 = sy * orig_w * 4;
@@ -37,53 +40,68 @@ pub fn detect_icon_regions(
             let i10 = row1 + sx;
             let i11 = i10 + 4;
 
-            let l00 = (raw[i00] as u32 * 77 + raw[i00 + 1] as u32 * 150 + raw[i00 + 2] as u32 * 29) >> 8;
-            let l01 = (raw[i01] as u32 * 77 + raw[i01 + 1] as u32 * 150 + raw[i01 + 2] as u32 * 29) >> 8;
-            let l10 = (raw[i10] as u32 * 77 + raw[i10 + 1] as u32 * 150 + raw[i10 + 2] as u32 * 29) >> 8;
-            let l11 = (raw[i11] as u32 * 77 + raw[i11 + 1] as u32 * 150 + raw[i11 + 2] as u32 * 29) >> 8;
-
-            gray[y * dw + x] = ((l00 + l01 + l10 + l11) >> 2) as u8;
+            let idx = y * dw + x;
+            ch_r[idx] = ((raw[i00] as u32 + raw[i01] as u32 + raw[i10] as u32 + raw[i11] as u32) >> 2) as u8;
+            ch_g[idx] = ((raw[i00 + 1] as u32 + raw[i01 + 1] as u32 + raw[i10 + 1] as u32 + raw[i11 + 1] as u32) >> 2) as u8;
+            ch_b[idx] = ((raw[i00 + 2] as u32 + raw[i01 + 2] as u32 + raw[i10 + 2] as u32 + raw[i11 + 2] as u32) >> 2) as u8;
         }
     }
 
-    // 2. Sobel gradient magnitude (L1 approximation: |gx| + |gy|, clamped to 0..255)
+    // 2. Max-channel isotropic Sobel gradient magnitude (alpha-max-beta-min Euclidean approx, clamped to 0..255)
+    //    Captures both monochrome and color-coded icons while avoiding L1 diagonal overshoot on faint rounded borders.
     let mut grad = vec![0u8; dw * dh];
     let mut sum: u64 = 0;
     let mut sum_sq: u64 = 0;
+    let mut max_grad: u8 = 0;
     let interior_count = ((dw - 2) * (dh - 2)) as f64;
+
+    #[inline(always)]
+    fn sobel_at(ch: &[u8], ym1: usize, y0: usize, yp1: usize, x: usize) -> u8 {
+        let tl = ch[ym1 + x - 1] as i32;
+        let tc = ch[ym1 + x] as i32;
+        let tr = ch[ym1 + x + 1] as i32;
+        let ml = ch[y0 + x - 1] as i32;
+        let mr = ch[y0 + x + 1] as i32;
+        let bl = ch[yp1 + x - 1] as i32;
+        let bc = ch[yp1 + x] as i32;
+        let br = ch[yp1 + x + 1] as i32;
+
+        let gx = -tl + tr - 2 * ml + 2 * mr - bl + br;
+        let gy = -tl - 2 * tc - tr + bl + 2 * bc + br;
+        let ax = gx.abs();
+        let ay = gy.abs();
+        let (hi, lo) = if ax >= ay { (ax, ay) } else { (ay, ax) };
+        ((hi + (lo * 3) / 8) >> 2).min(255) as u8
+    }
 
     for y in 1..(dh - 1) {
         let ym1 = (y - 1) * dw;
         let y0 = y * dw;
         let yp1 = (y + 1) * dw;
         for x in 1..(dw - 1) {
-            let tl = gray[ym1 + x - 1] as i32;
-            let tc = gray[ym1 + x] as i32;
-            let tr = gray[ym1 + x + 1] as i32;
-            let ml = gray[y0 + x - 1] as i32;
-            let mr = gray[y0 + x + 1] as i32;
-            let bl = gray[yp1 + x - 1] as i32;
-            let bc = gray[yp1 + x] as i32;
-            let br = gray[yp1 + x + 1] as i32;
-
-            let gx = -tl + tr - 2 * ml + 2 * mr - bl + br;
-            let gy = -tl - 2 * tc - tr + bl + 2 * bc + br;
-            let mag = ((gx.abs() + gy.abs()) >> 2).min(255) as u8;
+            let mr = sobel_at(&ch_r, ym1, y0, yp1, x);
+            let mg = sobel_at(&ch_g, ym1, y0, yp1, x);
+            let mb = sobel_at(&ch_b, ym1, y0, yp1, x);
+            let mag = mr.max(mg).max(mb);
             grad[y0 + x] = mag;
+            if mag > max_grad {
+                max_grad = mag;
+            }
             sum += mag as u64;
             sum_sq += (mag as u64) * (mag as u64);
         }
     }
 
-    let mean = sum as f64 / interior_count.max(1.0);
-    let variance = (sum_sq as f64 / interior_count.max(1.0) - mean * mean).max(0.0);
-    let std_dev = variance.sqrt();
-    if std_dev < 1.5 && mean < 2.0 {
+    if max_grad < 17 {
         // Uniform / blank image
         return Vec::new();
     }
 
-    let thresh = (mean + 1.15 * std_dev).max(26.0).min(110.0) as u8;
+    let mean = sum as f64 / interior_count.max(1.0);
+    let variance = (sum_sq as f64 / interior_count.max(1.0) - mean * mean).max(0.0);
+    let std_dev = variance.sqrt();
+
+    let thresh = (mean + 0.95 * std_dev).max(17.0).min(95.0) as u8;
 
     let mut edges = vec![0u8; dw * dh];
     for i in 0..(dw * dh) {
@@ -92,7 +110,8 @@ pub fn detect_icon_regions(
         }
     }
 
-    // 3. Single 3x3 dilation to merge disjoint strokes of a single icon into one connected blob
+    // 3. 4-connected cross dilation merges disjoint strokes inside one icon without fusing
+    //    tightly-stacked adjacent toolbar icons (e.g., Blender's left tool strip).
     let mut dilated = vec![0u8; dw * dh];
     for y in 1..(dh - 1) {
         let ym1 = (y - 1) * dw;
@@ -104,10 +123,6 @@ pub fn detect_icon_regions(
                 || edges[y0 + x + 1] != 0
                 || edges[ym1 + x] != 0
                 || edges[yp1 + x] != 0
-                || edges[ym1 + x - 1] != 0
-                || edges[ym1 + x + 1] != 0
-                || edges[yp1 + x - 1] != 0
-                || edges[yp1 + x + 1] != 0
             {
                 dilated[y0 + x] = 1;
             }
@@ -116,8 +131,8 @@ pub fn detect_icon_regions(
 
     // 4. Iterative 4-connected component extraction (stack flood-fill, zero recursion)
     let scale = (orig_w as f32 / 1920.0).clamp(0.6, 2.0);
-    let min_dim = (11.0 * scale).round() as i32;
-    let max_dim = (76.0 * scale).round() as i32;
+    let min_dim = (13.0 * scale).round() as i32;
+    let max_dim = (86.0 * scale).round() as i32;
 
     let mut visited = vec![0u8; dw * dh];
     let mut stack: Vec<(usize, usize)> = Vec::with_capacity(256);
@@ -198,7 +213,7 @@ pub fn detect_icon_regions(
 
             let ds_area = ((max_x - min_x + 1) * (max_y - min_y + 1)).max(1) as f32;
             let edge_density = edge_pixels as f32 / ds_area;
-            if !(0.06..=0.78).contains(&edge_density) {
+            if !(0.05..=0.82).contains(&edge_density) {
                 continue;
             }
 
@@ -240,10 +255,10 @@ pub fn detect_icon_regions(
         }
     }
 
-    // 8. Sort top-to-bottom (row bands of ~8*s px), left-to-right, and truncate to max_regions
+    // 8. Truncate by highest icon quality score first, then sort top-to-bottom, left-to-right
+    kept.truncate(max_regions);
     let row_band = (8.0 * scale).round().max(4.0) as i32;
     kept.sort_by_key(|b| (b[1] / row_band, b[0]));
-    kept.truncate(max_regions);
     kept
 }
 
@@ -378,5 +393,55 @@ mod tests {
             cx >= b[0] - 4 && cx <= b[0] + b[2] + 4 && cy >= b[1] - 4 && cy <= b[1] + b[3] + 4
         });
         assert!(hit_uncovered, "Uncovered icon should still be detected: {:?}", detected);
+    }
+
+    #[test]
+    fn test_regions_detects_dark_theme_dim_and_large_icons() {
+        let mut img = RgbaImage::from_pixel(1920, 1200, Rgba([44, 44, 48, 255]));
+
+        // Dim gray 20x20 Chrome-style toolbar icon (moderate Sobel gradient)
+        let dim_fg = Rgba([105, 108, 114, 255]);
+        for dx in 0..20 {
+            img.put_pixel(1710 + dx, 58, dim_fg);
+            img.put_pixel(1710 + dx, 59, dim_fg);
+            img.put_pixel(1710 + dx, 76, dim_fg);
+            img.put_pixel(1710 + dx, 77, dim_fg);
+        }
+        for dy in 0..20 {
+            img.put_pixel(1710, 58 + dy, dim_fg);
+            img.put_pixel(1711, 58 + dy, dim_fg);
+            img.put_pixel(1728, 58 + dy, dim_fg);
+            img.put_pixel(1729, 58 + dy, dim_fg);
+        }
+
+        // Larger 52x52 circular "+" Add Shortcut button
+        let circle_bg = Rgba([72, 74, 80, 255]);
+        let plus_fg = Rgba([220, 224, 232, 255]);
+        let ccx = 960i32;
+        let ccy = 760i32;
+        for y in (ccy - 26)..=(ccy + 26) {
+            for x in (ccx - 26)..=(ccx + 26) {
+                let d2 = (x - ccx) * (x - ccx) + (y - ccy) * (y - ccy);
+                if d2 <= 25 * 25 {
+                    img.put_pixel(x as u32, y as u32, circle_bg);
+                }
+            }
+        }
+        for d in -8..=8 {
+            img.put_pixel((ccx + d) as u32, ccy as u32, plus_fg);
+            img.put_pixel((ccx + d) as u32, (ccy + 1) as u32, plus_fg);
+            img.put_pixel(ccx as u32, (ccy + d) as u32, plus_fg);
+            img.put_pixel((ccx + 1) as u32, (ccy + d) as u32, plus_fg);
+        }
+
+        let detected = detect_icon_regions(&img, &[], 75);
+        let hit_dim = detected.iter().any(|b| {
+            1720 >= b[0] - 4 && 1720 <= b[0] + b[2] + 4 && 68 >= b[1] - 4 && 68 <= b[1] + b[3] + 4
+        });
+        let hit_circle = detected.iter().any(|b| {
+            ccx >= b[0] - 4 && ccx <= b[0] + b[2] + 4 && ccy >= b[1] - 4 && ccy <= b[1] + b[3] + 4
+        });
+        assert!(hit_dim, "Expected dim dark-theme toolbar icon to be detected; got {:?}", detected);
+        assert!(hit_circle, "Expected 52px circular '+' button to be detected; got {:?}", detected);
     }
 }

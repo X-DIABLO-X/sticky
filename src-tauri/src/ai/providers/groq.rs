@@ -22,6 +22,22 @@ impl GroqProvider {
         Self { api_key, client }
     }
 
+    fn is_text_only_model(model: &str) -> bool {
+        let lower = model.to_ascii_lowercase();
+        if lower.contains("vision")
+            || lower.contains("scout")
+            || lower.contains("maverick")
+            || lower.contains("qwen")
+        {
+            return false;
+        }
+        lower.contains("gpt-oss")
+            || lower.contains("llama-3")
+            || lower.contains("llama3")
+            || lower.contains("mixtral")
+            || lower.contains("gemma2")
+    }
+
     fn build_payload(
         model: &str,
         messages: &[ChatMessage],
@@ -104,9 +120,10 @@ impl LlmProvider for GroqProvider {
         tools: &[ToolDefinition],
     ) -> Result<Receiver<Result<ChatChunk>>> {
         let url = "https://api.groq.com/openai/v1/chat/completions";
-        let payload = Self::build_payload(model, messages, tools, true);
+        let include_images = !Self::is_text_only_model(model);
+        let payload = Self::build_payload(model, messages, tools, include_images);
 
-        let mut response = self.client
+        let response = self.client
             .post(url)
             .bearer_auth(&self.api_key)
             .json(&payload)
@@ -114,18 +131,9 @@ impl LlmProvider for GroqProvider {
             .await
             .map_err(|e| AppError::Ai(format!("Groq request failed: {}", e)))?;
 
-        // If a text-only Groq model rejects image_url with HTTP 400, retry without images
-        if response.status().as_u16() == 400 {
-            let retry_payload = Self::build_payload(model, messages, tools, false);
-            response = self.client
-                .post(url)
-                .bearer_auth(&self.api_key)
-                .json(&retry_payload)
-                .send()
-                .await
-                .map_err(|e| AppError::Ai(format!("Groq text-only retry failed: {}", e)))?;
-        }
-
+        // Do NOT silently strip images and retry on HTTP 400 for vision-intended models:
+        // returning Err lets ModelRouter fail over to true vision providers (Gemini, local Ollama,
+        // OpenRouter) rather than blinding the vision chain.
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();

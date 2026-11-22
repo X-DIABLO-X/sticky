@@ -1,6 +1,9 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tauri::{AppHandle, Manager, PhysicalPosition, PhysicalSize};
 use crate::error::{AppError, Result};
+
+static OVERLAY_CLICK_THROUGH: AtomicBool = AtomicBool::new(true);
 
 pub struct WindowManager;
 
@@ -46,6 +49,9 @@ impl WindowManager {
     }
 
     pub fn set_ignore_cursor_events(app: &AppHandle, label: &str, ignore: bool) -> Result<()> {
+        if label == "overlay" {
+            OVERLAY_CLICK_THROUGH.store(ignore, Ordering::SeqCst);
+        }
         if let Some(win) = app.get_webview_window(label) {
             win.set_ignore_cursor_events(ignore)
                 .map_err(|e| AppError::Config(e.to_string()))?;
@@ -121,7 +127,8 @@ impl WindowManager {
     }
 
     /// Directly applies Win32 `SetWindowPos(HWND_TOPMOST)` + `WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`
-    /// bypassing tao's stale `WS_EX_TOPMOST` style-cache bug (tauri-apps/tao#1234).
+    /// bypassing tao's stale `WS_EX_TOPMOST` style-cache bug (tauri-apps/tao#1234), and excludes Sticky's
+    /// HUD windows from screen capture via `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`.
     pub fn enforce_topmost_native(win: &tauri::WebviewWindow, click_through: bool) {
         let _ = win.set_always_on_top(true);
 
@@ -129,8 +136,9 @@ impl WindowManager {
         {
             use windows::Win32::Foundation::HWND;
             use windows::Win32::UI::WindowsAndMessaging::{
-                GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, HWND_TOPMOST,
-                SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+                GetWindowDisplayAffinity, GetWindowLongPtrW, SetWindowDisplayAffinity,
+                SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, HWND_TOPMOST, SWP_NOACTIVATE,
+                SWP_NOMOVE, SWP_NOSIZE, WDA_EXCLUDEFROMCAPTURE, WS_EX_LAYERED, WS_EX_NOACTIVATE,
                 WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
             };
 
@@ -155,6 +163,15 @@ impl WindowManager {
                         0,
                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
                     );
+
+                    // Keep Sticky's own overlay/pill/bubble 100% visible to the user,
+                    // but completely invisible to xcap / desktop capture & WinRT OCR.
+                    let mut current_affinity: u32 = 0;
+                    if GetWindowDisplayAffinity(hwnd, &mut current_affinity).is_err()
+                        || current_affinity != WDA_EXCLUDEFROMCAPTURE.0
+                    {
+                        let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+                    }
                 }
             }
         }
@@ -167,7 +184,8 @@ impl WindowManager {
             let mut interval = tokio::time::interval(Duration::from_millis(750));
             loop {
                 interval.tick().await;
-                for (label, click_through) in [("overlay", true), ("pill", false), ("bubble", false)] {
+                let overlay_ct = OVERLAY_CLICK_THROUGH.load(Ordering::SeqCst);
+                for (label, click_through) in [("overlay", overlay_ct), ("pill", false), ("bubble", false)] {
                     if let Some(win) = app.get_webview_window(label) {
                         if win.is_visible().unwrap_or(false) {
                             Self::enforce_topmost_native(&win, click_through);

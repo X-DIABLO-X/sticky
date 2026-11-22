@@ -85,7 +85,8 @@ impl LocalLlamaProvider {
             "messages": formatted_messages,
             "stream": true,
             "options": {
-                "temperature": 0.2
+                "temperature": 0.2,
+                "num_ctx": 8192
             }
         });
 
@@ -137,13 +138,27 @@ impl LlmProvider for LocalLlamaProvider {
             .await
             .map_err(|e| AppError::Ai(format!("Local Ollama request error: {e}")))?;
 
-        // If a text-only or older Ollama build rejects `images` or `think: false` with HTTP 400, retry cleanly
+        // Step 1 fallback: if Ollama rejects `"think": false` with HTTP 400, retry WITH images preserved
         if response.status().as_u16() == 400 {
-            let retry_payload = Self::build_ollama_payload(model, messages, tools, false, false);
+            let retry_with_images =
+                Self::build_ollama_payload(model, messages, tools, true, false);
             response = self
                 .client
                 .post(&url)
-                .json(&retry_payload)
+                .json(&retry_with_images)
+                .send()
+                .await
+                .map_err(|e| AppError::Ai(format!("Local Ollama vision retry error: {e}")))?;
+        }
+
+        // Step 2 fallback: ONLY if still HTTP 400, retry without images for text-only local models
+        if response.status().as_u16() == 400 {
+            let retry_text_only =
+                Self::build_ollama_payload(model, messages, tools, false, false);
+            response = self
+                .client
+                .post(&url)
+                .json(&retry_text_only)
                 .send()
                 .await
                 .map_err(|e| AppError::Ai(format!("Local Ollama text-only retry error: {e}")))?;

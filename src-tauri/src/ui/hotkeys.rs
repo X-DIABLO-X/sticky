@@ -75,7 +75,9 @@ impl HotkeyManager {
                     let app_handle = app.clone();
                     tauri::async_runtime::spawn(async move {
                         let current = talk_ctrl.get_state().await;
-                        if current == crate::features::talk::TalkState::Idle {
+                        if current == crate::features::talk::TalkState::Idle
+                            || current == crate::features::talk::TalkState::Speaking
+                        {
                             let _ = WindowManager::show(&app_handle, "bubble");
                             let _ = WindowManager::position_bubble_at_cursor(&app_handle);
                             let _ = tauri::Emitter::emit(&app_handle, "hotkey:talk_down", ());

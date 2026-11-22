@@ -1,5 +1,4 @@
-use std::io::Cursor;
-use image::{codecs::jpeg::JpegEncoder, imageops::FilterType, DynamicImage, GenericImageView, ImageFormat, RgbaImage};
+use image::{codecs::jpeg::JpegEncoder, imageops::FilterType, DynamicImage, GenericImageView, RgbaImage};
 use xcap::Monitor;
 use crate::error::{AppError, Result};
 
@@ -19,7 +18,7 @@ pub struct CapturedScreen {
 pub struct DetectedElement {
     pub id: u32,
     pub label: String,
-    pub source: String, // "ocr" or "a11y"
+    pub source: String, // "ocr", "a11y", or "icon"
     pub bbox_norm: [i32; 4], // [x1, y1, x2, y2] in 0..1000
     pub center_norm: [i32; 2], // [cx, cy] in 0..1000
 }
@@ -147,7 +146,7 @@ impl ScreenCaptureService {
         let monitors = Monitor::all()
             .map_err(|e| AppError::Screen(format!("Failed to enumerate monitors: {}", e)))?;
 
-        let monitor = monitors.get(monitor_index)
+        let monitor = Self::select_monitor(&monitors, monitor_index)
             .ok_or_else(|| AppError::Screen(format!("Monitor index {} out of range", monitor_index)))?;
 
         let img = monitor.capture_image()
@@ -181,10 +180,12 @@ impl ScreenCaptureService {
 
         let (final_w, final_h) = final_img.dimensions();
 
-        // Encode as JPEG with 80% quality
+        // Convert RGBA -> RGB before JPEG encoding (image 0.25 JpegEncoder rejects Rgba8)
+        let rgb_img = DynamicImage::ImageRgba8(final_img).to_rgb8();
         let mut jpeg_bytes = Vec::new();
-        let mut cursor = Cursor::new(&mut jpeg_bytes);
-        final_img.write_to(&mut cursor, ImageFormat::Jpeg)
+        let encoder = JpegEncoder::new_with_quality(&mut jpeg_bytes, 85);
+        rgb_img
+            .write_with_encoder(encoder)
             .map_err(|e| AppError::Screen(format!("Failed to encode JPEG: {}", e)))?;
 
         use base64::Engine;
@@ -206,8 +207,7 @@ impl ScreenCaptureService {
         let monitors = Monitor::all()
             .map_err(|e| AppError::Screen(format!("Failed to enumerate monitors: {}", e)))?;
 
-        let monitor = monitors
-            .get(monitor_index)
+        let monitor = Self::select_monitor(&monitors, monitor_index)
             .ok_or_else(|| AppError::Screen(format!("Monitor index {} out of range", monitor_index)))?;
 
         let img = monitor
@@ -250,8 +250,8 @@ impl ScreenCaptureService {
     }
 
     /// Captures the monitor at full resolution, runs native WinRT OCR, merges Windows UIA (`a11y_nodes`),
-    /// resizes to `max_width.unwrap_or(1280)`, and draws BOTH the 0..1000 coordinate grid and crisp
-    /// Set-of-Mark (`[id]`) overlays for every detected element.
+    /// detects classical CV icon regions, resizes to `max_width.unwrap_or(1440)`, and draws BOTH the
+    /// 0..1000 coordinate grid and high-contrast Set-of-Mark (`#id`) overlays for every detected element.
     pub fn capture_grounded_for_vlm(
         monitor_index: usize,
         max_width: Option<u32>,
@@ -270,21 +270,54 @@ impl ScreenCaptureService {
             .capture_image()
             .map_err(|e| AppError::Screen(format!("Failed to capture screen: {}", e)))?;
 
+        let grounded = Self::ground_image_for_vlm(
+            &img,
+            monitor_index,
+            mon_x,
+            mon_y,
+            max_width,
+            a11y_nodes,
+        )?;
+
+        // Best-effort save of the exact encoded JPEG sent to the VLM for live debugging/inspection
+        if let Some(home) = dirs::home_dir() {
+            let dir = home.join(".heyclicky");
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(dir.join("last_vlm_frame.jpg"), &grounded.screen.data);
+        }
+
+        Ok(grounded)
+    }
+
+    /// Runs the complete grounding pipeline (full-res WinRT OCR + UIA merge + CV icon detection +
+    /// 0..1000 grid + high-contrast Set-of-Mark badges + JPEG encoding) on any supplied `RgbaImage`.
+    pub fn ground_image_for_vlm(
+        img: &RgbaImage,
+        monitor_index: usize,
+        mon_x: i32,
+        mon_y: i32,
+        max_width: Option<u32>,
+        a11y_nodes: &[crate::screen::a11y::A11yNodeCompact],
+    ) -> Result<GroundedCapture> {
+        const MAX_TOTAL_ELEMENTS: usize = 160;
+        const MAX_ICON_REGIONS: usize = 75;
+
         let (orig_w, orig_h) = img.dimensions();
 
         // 1. Run WinRT OCR on the FULL-RES image for maximum text detection accuracy
-        let ocr_words = crate::screen::ocr::extract_ocr_words(&img);
+        let ocr_words = crate::screen::ocr::extract_ocr_words(img);
         let ocr_raw_boxes: Vec<[i32; 4]> = ocr_words.iter().map(|w| w.bbox).collect();
 
         // 1b. Run classical CV icon detector on FULL-RES image to capture unlabeled toolbar buttons & gizmos
-        let icon_boxes = crate::screen::regions::detect_icon_regions(&img, &ocr_raw_boxes, 55);
+        let icon_boxes =
+            crate::screen::regions::detect_icon_regions(img, &ocr_raw_boxes, MAX_ICON_REGIONS);
 
         let mut elements: Vec<DetectedElement> =
             Vec::with_capacity(ocr_words.len() + a11y_nodes.len() + icon_boxes.len());
 
         for word in ocr_words {
             let label = word.text.trim();
-            if label.is_empty() {
+            if label.is_empty() || is_ocr_noise_token(label) {
                 continue;
             }
             let (bbox_norm, center_norm) =
@@ -300,6 +333,9 @@ impl ScreenCaptureService {
                 center_norm,
             });
         }
+
+        // Remove horizontal numeric ruler/timeline tick rows (e.g. Blender's 12, 24, ..., 252)
+        filter_ruler_tick_rows(&mut elements);
 
         // 2. Merge UIA nodes, deduplicating against existing elements near the same center with similar label
         for node in a11y_nodes {
@@ -351,8 +387,21 @@ impl ScreenCaptureService {
             }
         }
 
-        // 2b. Merge CV-detected icon regions (skip any already covered by an A11y button)
+        // Keep OCR + A11y elements first (sorted top-to-bottom, left-to-right) before allocating
+        // remaining slots up to MAX_TOTAL_ELEMENTS (160) for up to MAX_ICON_REGIONS (75) CV icons.
+        elements.sort_by_key(|el| (el.bbox_norm[1] / 8, el.bbox_norm[0]));
+        elements.truncate(MAX_TOTAL_ELEMENTS);
+
+        let icon_budget = MAX_TOTAL_ELEMENTS
+            .saturating_sub(elements.len())
+            .min(MAX_ICON_REGIONS);
+
+        // 2b. Merge CV-detected icon regions (skip any already covered by OCR/A11y)
+        let mut added_icons = 0usize;
         for ibox in icon_boxes {
+            if added_icons >= icon_budget {
+                break;
+            }
             let (bbox_norm, center_norm) =
                 Self::physical_bbox_to_normalized(ibox, 0, 0, orig_w, orig_h);
             if bbox_norm[2] <= bbox_norm[0] || bbox_norm[3] <= bbox_norm[1] {
@@ -366,42 +415,42 @@ impl ScreenCaptureService {
             if !is_dup {
                 elements.push(DetectedElement {
                     id: 0,
-                    label: "icon".to_string(),
+                    label: spatial_icon_label(center_norm),
                     source: "icon".to_string(),
                     bbox_norm,
                     center_norm,
                 });
+                added_icons += 1;
             }
         }
 
-        // 3. Sort top-to-bottom (8-unit row bands), left-to-right so menus & toolbars always come first
+        // 3. Sort all kept elements top-to-bottom (8-unit row bands), left-to-right so menus & toolbars come first
         elements.sort_by_key(|el| (el.bbox_norm[1] / 8, el.bbox_norm[0]));
 
-        // 4. Cap to top 150 elements and assign sequential 1-based IDs
-        elements.truncate(150);
+        // 4. Assign sequential 1-based IDs
         for (idx, el) in elements.iter_mut().enumerate() {
             el.id = (idx + 1) as u32;
         }
 
-        // 5. Resize down to max_width (default 1280)
-        let target_max_w = max_width.unwrap_or(1280).max(1);
+        // 5. Resize down to max_width (default 1440 for ultra-crisp VLM digit legibility)
+        let target_max_w = max_width.unwrap_or(1440).max(1);
         let mut final_img = if orig_w > target_max_w {
             let new_h = ((orig_h as f32 * (target_max_w as f32 / orig_w as f32)).round() as u32).max(1);
-            image::imageops::resize(&img, target_max_w, new_h, FilterType::Triangle)
+            image::imageops::resize(img, target_max_w, new_h, FilterType::Triangle)
         } else {
-            img
+            img.clone()
         };
 
-        // 6. Draw coordinate grid + Set-of-Mark bounding boxes & [id] badges
+        // 6. Draw coordinate grid + high-contrast Set-of-Mark bounding boxes & [id] badges
         draw_coordinate_grid(&mut final_img);
         draw_som_overlays(&mut final_img, &elements);
 
         let (final_w, final_h) = final_img.dimensions();
 
-        // 7. Encode JPEG at 82% quality
+        // 7. Encode JPEG at 92% quality so solid badge digits stay razor-sharp without chroma smear
         let rgb_img = DynamicImage::ImageRgba8(final_img).to_rgb8();
         let mut jpeg_bytes = Vec::new();
-        let encoder = JpegEncoder::new_with_quality(&mut jpeg_bytes, 82);
+        let encoder = JpegEncoder::new_with_quality(&mut jpeg_bytes, 92);
         rgb_img
             .write_with_encoder(encoder)
             .map_err(|e| AppError::Screen(format!("Failed to encode grounded VLM JPEG: {}", e)))?;
@@ -431,13 +480,97 @@ pub fn capture_grounded_for_vlm(
     ScreenCaptureService::capture_grounded_for_vlm(monitor_index, max_width, a11y_nodes)
 }
 
+fn is_ocr_noise_token(label: &str) -> bool {
+    let trimmed = label.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let char_count = trimmed.chars().count();
+    if char_count == 1 {
+        let ch = trimmed.chars().next().unwrap();
+        // Keep genuine single-character UI actions like close ('x'/'X'), add ('+'), help ('?')
+        return !matches!(ch, 'x' | 'X' | '+' | '?');
+    }
+    // Reject purely punctuation/symbol OCR fragments (e.g. "...", "—", "-|", ">>")
+    trimmed
+        .chars()
+        .all(|c| !c.is_alphanumeric() && c != '+' && c != '?')
+}
+
+/// Drops horizontal ruler/timeline numeric tick spam (e.g. Blender/video-editor frame ticks `12, 24, 36...`)
+/// when 5 or more narrow pure-integer OCR tokens lie on the same horizontal band.
+fn filter_ruler_tick_rows(elements: &mut Vec<DetectedElement>) {
+    let mut row_counts: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
+    for el in elements.iter() {
+        if el.source == "ocr"
+            && (el.bbox_norm[2] - el.bbox_norm[0]) <= 28
+            && !el.label.is_empty()
+            && el.label.chars().all(|c| c.is_ascii_digit())
+        {
+            let band = el.center_norm[1] / 6;
+            *row_counts.entry(band).or_insert(0) += 1;
+        }
+    }
+    elements.retain(|el| {
+        if el.source == "ocr"
+            && (el.bbox_norm[2] - el.bbox_norm[0]) <= 28
+            && !el.label.is_empty()
+            && el.label.chars().all(|c| c.is_ascii_digit())
+        {
+            let band = el.center_norm[1] / 6;
+            row_counts.get(&band).copied().unwrap_or(0) < 5
+        } else {
+            true
+        }
+    });
+}
+
 fn labels_similar(a: &str, b: &str) -> bool {
     let al = a.trim().to_ascii_lowercase();
     let bl = b.trim().to_ascii_lowercase();
     if al.is_empty() || bl.is_empty() {
         return false;
     }
-    al == bl || al.contains(&bl) || bl.contains(&al)
+    if al == bl {
+        return true;
+    }
+    al.len().min(bl.len()) >= 3 && (al.contains(&bl) || bl.contains(&al))
+}
+
+/// Gives unlabeled CV-detected icon regions descriptive screen-zone names
+/// so the VLM can disambiguate toolbar buttons, window caption controls, taskbar items, and panels.
+fn spatial_icon_label(center_norm: [i32; 2]) -> String {
+    let [cx, cy] = center_norm;
+    if cy < 32 && cx > 890 {
+        return "window-control (top-right)".to_string();
+    }
+    if cy > 955 {
+        return "taskbar-icon (bottom)".to_string();
+    }
+    let region = if cy < 115 {
+        if cx < 180 {
+            "toolbar-left"
+        } else if cx > 720 {
+            "toolbar-right"
+        } else {
+            "top-bar"
+        }
+    } else if cy > 880 {
+        if cx < 180 {
+            "bottom-left"
+        } else if cx > 820 {
+            "bottom-right"
+        } else {
+            "bottom-bar"
+        }
+    } else if cx < 120 {
+        "left-toolbar"
+    } else if cx > 760 {
+        "right-panel"
+    } else {
+        "center"
+    };
+    format!("icon ({})", region)
 }
 
 /// Compact built-in 5x7 bitmap font for digits '0'-'9' and ','.
@@ -657,8 +790,8 @@ pub fn draw_coordinate_grid(img: &mut RgbaImage) {
     }
 }
 
-/// Draws crisp Set-of-Mark (SoM) bounding boxes and collision-free `[id]` badges for every
-/// `DetectedElement` directly onto `img` so the VLM can visually read exact element `#id`s.
+/// Draws crisp Set-of-Mark (SoM) 2px bounding boxes and high-contrast collision-free `#id` badges
+/// for every `DetectedElement` directly onto `img` so even compact VLMs can read every element ID.
 pub fn draw_som_overlays(img: &mut RgbaImage, elements: &[DetectedElement]) {
     let w = img.width() as i32;
     let h = img.height() as i32;
@@ -666,8 +799,11 @@ pub fn draw_som_overlays(img: &mut RgbaImage, elements: &[DetectedElement]) {
         return;
     }
 
-    // Track placed tag rects `[x, y, w, h]` so adjacent menu items never overlap their `#id` badges
-    let mut placed_tags: Vec<[i32; 4]> = Vec::with_capacity(elements.len());
+    let scale: i32 = if img.width() >= 1000 { 2 } else { 1 };
+
+    // Precompute pixel boxes and source-coded accent colors
+    let mut box_entries: Vec<([i32; 4], (u8, u8, u8), String)> = Vec::with_capacity(elements.len());
+    let mut box_rects: Vec<[i32; 4]> = Vec::with_capacity(elements.len());
 
     for el in elements {
         let px1 = (((el.bbox_norm[0] as f64) / 1000.0) * w as f64).round() as i32;
@@ -680,36 +816,77 @@ pub fn draw_som_overlays(img: &mut RgbaImage, elements: &[DetectedElement]) {
         let x2 = px2.clamp(x1, w - 1);
         let y2 = py2.clamp(y1, h - 1);
 
-        // Color-coded by source: Emerald = OCR text, Amber = UIA control, Sky-Blue = CV icon
-        let (r, g, b) = match el.source.as_str() {
-            "a11y" => (251u8, 191u8, 36u8), // Amber
-            "icon" => (56u8, 189u8, 248u8), // Sky-Blue
-            _ => (34u8, 211u8, 153u8),      // Emerald
+        // Color-coded by source with high contrast for pure white digits:
+        // OCR = vivid emerald green, UIA = vivid amber/orange, CV icon = vivid magenta/rose
+        let rgb = match el.source.as_str() {
+            "a11y" => (217u8, 119u8, 6u8),
+            "icon" => (219u8, 39u8, 119u8),
+            _ => (16u8, 163u8, 107u8),
         };
 
-        // 1px crisp bounding box
-        let box_alpha = 0.85;
-        for x in x1..=x2 {
-            blend_pixel(img, x, y1, r, g, b, box_alpha);
-            blend_pixel(img, x, y2, r, g, b, box_alpha);
-        }
-        for y in y1..=y2 {
-            blend_pixel(img, x1, y, r, g, b, box_alpha);
-            blend_pixel(img, x2, y, r, g, b, box_alpha);
-        }
+        box_rects.push([x1, y1, (x2 - x1 + 1).max(1), (y2 - y1 + 1).max(1)]);
+        box_entries.push(([x1, y1, x2, y2], rgb, el.id.to_string()));
+    }
 
-        // Collision-free numeric ID badge anchored to the box
-        let id_text = el.id.to_string();
-        if let Some(tag_rect) = draw_compact_som_tag(img, &id_text, x1, y1, x2, y2, (r, g, b), &placed_tags) {
+    // Pass 1: Draw all 2px bounding boxes first (1px on box edge + 1px outward so small icons stay clear)
+    let box_alpha = 0.94;
+    for &([x1, y1, x2, y2], (r, g, b), _) in &box_entries {
+        let ox1 = (x1 - 1).max(0);
+        let oy1 = (y1 - 1).max(0);
+        let ox2 = (x2 + 1).min(w - 1);
+        let oy2 = (y2 + 1).min(h - 1);
+
+        for x in ox1..=ox2 {
+            blend_pixel(img, x, oy1, r, g, b, box_alpha);
+            if y1 != oy1 {
+                blend_pixel(img, x, y1, r, g, b, box_alpha);
+            }
+            blend_pixel(img, x, y2, r, g, b, box_alpha);
+            if oy2 != y2 {
+                blend_pixel(img, x, oy2, r, g, b, box_alpha);
+            }
+        }
+        for y in (y1 + 1)..y2 {
+            blend_pixel(img, ox1, y, r, g, b, box_alpha);
+            if x1 != ox1 {
+                blend_pixel(img, x1, y, r, g, b, box_alpha);
+            }
+            blend_pixel(img, x2, y, r, g, b, box_alpha);
+            if ox2 != x2 {
+                blend_pixel(img, ox2, y, r, g, b, box_alpha);
+            }
+        }
+    }
+
+    // Pass 2: Draw solid high-contrast `#id` pills ON TOP of all boxes so lines never cut across digits
+    let mut placed_tags: Vec<[i32; 4]> = Vec::with_capacity(elements.len());
+    for (idx, ([x1, y1, x2, y2], rgb, id_text)) in box_entries.iter().enumerate() {
+        if let Some(tag_rect) = draw_compact_som_tag(
+            img,
+            id_text,
+            *x1,
+            *y1,
+            *x2,
+            *y2,
+            scale,
+            *rgb,
+            &placed_tags,
+            &box_rects,
+            idx,
+        ) {
             placed_tags.push(tag_rect);
         }
     }
 }
 
-fn rects_overlap(a: &[i32; 4], b: &[i32; 4]) -> bool {
-    a[0] < b[0] + b[2] && a[0] + a[2] > b[0] && a[1] < b[1] + b[3] && a[1] + a[3] > b[1]
+fn rects_overlap_padded(a: &[i32; 4], b: &[i32; 4], pad: i32) -> bool {
+    a[0] - pad < b[0] + b[2]
+        && a[0] + a[2] + pad > b[0]
+        && a[1] - pad < b[1] + b[3]
+        && a[1] + a[3] + pad > b[1]
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_compact_som_tag(
     img: &mut RgbaImage,
     text: &str,
@@ -717,18 +894,22 @@ fn draw_compact_som_tag(
     y1: i32,
     x2: i32,
     y2: i32,
-    fg_rgb: (u8, u8, u8),
+    scale: i32,
+    bg_rgb: (u8, u8, u8),
     placed_tags: &[[i32; 4]],
+    element_boxes: &[[i32; 4]],
+    self_idx: usize,
 ) -> Option<[i32; 4]> {
     let char_count = text.chars().count() as i32;
     if char_count == 0 {
         return None;
     }
-    let glyph_w = 5;
-    let glyph_h = 7;
-    let spacing = 1;
-    let pad_x = 2;
-    let pad_y = 1;
+    let scale = scale.max(1);
+    let glyph_w = 5 * scale;
+    let glyph_h = 7 * scale;
+    let spacing = scale;
+    let pad_x = if scale >= 2 { 4 } else { 2 };
+    let pad_y = if scale >= 2 { 3 } else { 2 };
 
     let text_w = char_count * glyph_w + (char_count - 1).max(0) * spacing;
     let tag_w = text_w + pad_x * 2;
@@ -736,43 +917,101 @@ fn draw_compact_som_tag(
 
     let max_x = (img.width() as i32 - tag_w).max(0);
     let max_y = (img.height() as i32 - tag_h).max(0);
+    let gap = 2;
 
-    // Candidate anchor positions in priority order: above-left, below-left, right-top, left-top, above-right, below-right
+    // Candidate anchor positions around the bounding box
     let candidates = [
-        (x1, y1 - tag_h - 1),
-        (x1, y2 + 1),
-        (x2 + 1, y1),
-        (x1 - tag_w - 1, y1),
-        (x2 - tag_w, y1 - tag_h - 1),
-        (x2 - tag_w, y2 + 1),
+        (x1, y1 - tag_h - gap),                    // above-left
+        (x1, y2 + gap),                            // below-left
+        (x2 + gap, y1),                            // right-top
+        (x1 - tag_w - gap, y1),                    // left-top
+        (x2 - tag_w, y1 - tag_h - gap),            // above-right
+        (x2 - tag_w, y2 + gap),                    // below-right
+        (x2 + gap, y2 - tag_h),                    // right-bottom
+        (x1 - tag_w - gap, y2 - tag_h),            // left-bottom
+        ((x1 + x2 - tag_w) / 2, y1 - tag_h - gap), // above-center
+        ((x1 + x2 - tag_w) / 2, y2 + gap),         // below-center
     ];
 
-    let mut chosen = [x1.clamp(0, max_x), (y1 - tag_h).clamp(0, max_y), tag_w, tag_h];
+    let mut chosen: Option<[i32; 4]> = None;
+
+    // Tier 1: No overlap with any placed badge (1px margin) AND no overlap with any other element box
     for (cx, cy) in candidates {
         if cx < 0 || cy < 0 || cx > max_x || cy > max_y {
             continue;
         }
         let rect = [cx, cy, tag_w, tag_h];
-        if !placed_tags.iter().any(|p| rects_overlap(&rect, p)) {
-            chosen = rect;
+        if placed_tags.iter().any(|p| rects_overlap_padded(&rect, p, 1)) {
+            continue;
+        }
+        let hits_other_box = element_boxes
+            .iter()
+            .enumerate()
+            .any(|(i, b)| i != self_idx && rects_overlap_padded(&rect, b, 0));
+        if !hits_other_box {
+            chosen = Some(rect);
             break;
         }
     }
 
-    let (tx, ty) = (chosen[0], chosen[1]);
+    // Tier 2: No overlap with any placed badge (1px margin)
+    if chosen.is_none() {
+        for (cx, cy) in candidates {
+            if cx < 0 || cy < 0 || cx > max_x || cy > max_y {
+                continue;
+            }
+            let rect = [cx, cy, tag_w, tag_h];
+            if !placed_tags.iter().any(|p| rects_overlap_padded(&rect, p, 1)) {
+                chosen = Some(rect);
+                break;
+            }
+        }
+    }
 
-    // Dark high-contrast pill background + 1px accent border
-    draw_filled_rect(img, tx, ty, tag_w, tag_h, 6, 10, 16, 0.92);
+    // Tier 3: Nudged secondary ring (for densely packed rows/strips)
+    if chosen.is_none() {
+        let nudged = [
+            (x1, y1 - 2 * tag_h - gap - 2),
+            (x1, y2 + tag_h + gap + 2),
+            (x2 + tag_w + gap + 2, y1),
+            (x1 - 2 * tag_w - gap - 2, y1),
+            (x1 + tag_w + 2, y1 - tag_h - gap),
+            (x1 + tag_w + 2, y2 + gap),
+        ];
+        for (cx, cy) in nudged {
+            if cx < 0 || cy < 0 || cx > max_x || cy > max_y {
+                continue;
+            }
+            let rect = [cx, cy, tag_w, tag_h];
+            if !placed_tags.iter().any(|p| rects_overlap_padded(&rect, p, 1)) {
+                chosen = Some(rect);
+                break;
+            }
+        }
+    }
+
+    let rect = chosen.unwrap_or([
+        x1.clamp(0, max_x),
+        (y1 - tag_h - gap).clamp(0, max_y),
+        tag_w,
+        tag_h,
+    ]);
+    let (tx, ty) = (rect[0], rect[1]);
+
+    // Solid vivid color-coded pill background (100% opaque for maximum contrast)
+    draw_filled_rect(img, tx, ty, tag_w, tag_h, bg_rgb.0, bg_rgb.1, bg_rgb.2, 1.0);
+
+    // Crisp 1px dark outer hairline to separate pills cleanly from both light & dark UI backgrounds
     for dx in 1..(tag_w - 1) {
-        blend_pixel(img, tx + dx, ty, fg_rgb.0, fg_rgb.1, fg_rgb.2, 0.90);
-        blend_pixel(img, tx + dx, ty + tag_h - 1, fg_rgb.0, fg_rgb.1, fg_rgb.2, 0.90);
+        blend_pixel(img, tx + dx, ty, 10, 14, 20, 0.85);
+        blend_pixel(img, tx + dx, ty + tag_h - 1, 10, 14, 20, 0.85);
     }
     for dy in 1..(tag_h - 1) {
-        blend_pixel(img, tx, ty + dy, fg_rgb.0, fg_rgb.1, fg_rgb.2, 0.90);
-        blend_pixel(img, tx + tag_w - 1, ty + dy, fg_rgb.0, fg_rgb.1, fg_rgb.2, 0.90);
+        blend_pixel(img, tx, ty + dy, 10, 14, 20, 0.85);
+        blend_pixel(img, tx + tag_w - 1, ty + dy, 10, 14, 20, 0.85);
     }
 
-    // Crisp 5x7 bitmap digits
+    // Pure white bold bitmap digits (`10x14` px per digit when scale=2, `5x7` when scale=1)
     let mut cursor_x = tx + pad_x;
     let cursor_y = ty + pad_y;
     for ch in text.chars() {
@@ -780,15 +1019,19 @@ fn draw_compact_som_tag(
             for (row_idx, &bits) in rows.iter().enumerate() {
                 for col_idx in 0..5 {
                     if (bits & (1 << (4 - col_idx))) != 0 {
-                        blend_pixel(
-                            img,
-                            cursor_x + col_idx,
-                            cursor_y + row_idx as i32,
-                            fg_rgb.0,
-                            fg_rgb.1,
-                            fg_rgb.2,
-                            0.98,
-                        );
+                        for sy in 0..scale {
+                            for sx in 0..scale {
+                                blend_pixel(
+                                    img,
+                                    cursor_x + col_idx * scale + sx,
+                                    cursor_y + (row_idx as i32) * scale + sy,
+                                    255,
+                                    255,
+                                    255,
+                                    1.0,
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -796,7 +1039,7 @@ fn draw_compact_som_tag(
         cursor_x += glyph_w + spacing;
     }
 
-    Some(chosen)
+    Some(rect)
 }
 
 #[cfg(test)]
@@ -826,5 +1069,119 @@ mod tests {
         assert_ne!(img.get_pixel(320, 180), baseline.get_pixel(320, 180));
         // Verify top ruler tick at X=50 (px = 32) was drawn
         assert_ne!(img.get_pixel(32, 0), baseline.get_pixel(32, 0));
+    }
+
+    #[test]
+    fn test_spatial_icon_labels() {
+        assert_eq!(spatial_icon_label([956, 21]), "window-control (top-right)");
+        assert_eq!(spatial_icon_label([895, 65]), "icon (toolbar-right)");
+        assert_eq!(spatial_icon_label([30, 300]), "icon (left-toolbar)");
+        assert_eq!(spatial_icon_label([835, 420]), "icon (right-panel)");
+        assert_eq!(spatial_icon_label([450, 50]), "icon (top-bar)");
+        assert_eq!(spatial_icon_label([500, 640]), "icon (center)");
+        assert_eq!(spatial_icon_label([500, 960]), "taskbar-icon (bottom)");
+    }
+
+    #[test]
+    fn test_draw_som_overlays_high_contrast_scale2() {
+        let mut img = RgbaImage::from_pixel(1440, 900, Rgba([40, 40, 44, 255]));
+        let elements = vec![
+            DetectedElement {
+                id: 1,
+                label: "File".to_string(),
+                source: "ocr".to_string(),
+                bbox_norm: [10, 40, 40, 60],
+                center_norm: [25, 50],
+            },
+            DetectedElement {
+                id: 2,
+                label: "Allow".to_string(),
+                source: "a11y".to_string(),
+                bbox_norm: [600, 100, 660, 130],
+                center_norm: [630, 115],
+            },
+            DetectedElement {
+                id: 3,
+                label: "icon (top-right)".to_string(),
+                source: "icon".to_string(),
+                bbox_norm: [890, 55, 910, 80],
+                center_norm: [900, 67],
+            },
+        ];
+
+        draw_som_overlays(&mut img, &elements);
+
+        // Verify pure white digits and each source's vivid pill color were painted
+        let has_white = img.pixels().any(|p| p.0[0] == 255 && p.0[1] == 255 && p.0[2] == 255);
+        let has_emerald = img.pixels().any(|p| p.0[0] == 16 && p.0[1] == 163 && p.0[2] == 107);
+        let has_amber = img.pixels().any(|p| p.0[0] == 217 && p.0[1] == 119 && p.0[2] == 6);
+        let has_magenta = img.pixels().any(|p| p.0[0] == 219 && p.0[1] == 39 && p.0[2] == 119);
+
+        assert!(has_white, "Expected pure white digits on SoM pills");
+        assert!(has_emerald, "Expected emerald OCR pill/border");
+        assert!(has_amber, "Expected amber UIA pill/border");
+        assert!(has_magenta, "Expected magenta CV icon pill/border");
+    }
+
+    #[test]
+    fn test_ground_image_for_vlm_smoke() {
+        let mut img = RgbaImage::from_pixel(1200, 800, Rgba([42, 42, 46, 255]));
+        // Draw a crisp synthetic icon in the top-right corner
+        let fg = Rgba([180, 185, 195, 255]);
+        for dx in 0..28 {
+            img.put_pixel(1080 + dx, 44, fg);
+            img.put_pixel(1080 + dx, 45, fg);
+            img.put_pixel(1080 + dx, 70, fg);
+            img.put_pixel(1080 + dx, 71, fg);
+        }
+        for dy in 0..28 {
+            img.put_pixel(1080, 44 + dy, fg);
+            img.put_pixel(1081, 44 + dy, fg);
+            img.put_pixel(1106, 44 + dy, fg);
+            img.put_pixel(1107, 44 + dy, fg);
+        }
+
+        let grounded = ScreenCaptureService::ground_image_for_vlm(&img, 0, 0, 0, Some(1440), &[])
+            .expect("ground_image_for_vlm should succeed");
+        assert_eq!(grounded.screen.width, 1200);
+        assert_eq!(grounded.screen.height, 800);
+        assert!(!grounded.screen.data.is_empty());
+        assert!(
+            grounded.elements.iter().any(|e| e.source == "icon" && e.label == "icon (toolbar-right)"),
+            "Expected top-right toolbar icon element with spatial label, got {:?}",
+            grounded.elements
+        );
+    }
+
+    #[test]
+    fn test_ocr_noise_and_ruler_tick_filtering() {
+        assert!(is_ocr_noise_token(">"));
+        assert!(is_ocr_noise_token("v"));
+        assert!(is_ocr_noise_token("•"));
+        assert!(is_ocr_noise_token("1"));
+        assert!(!is_ocr_noise_token("x"));
+        assert!(!is_ocr_noise_token("+"));
+        assert!(!is_ocr_noise_token("Add"));
+
+        let mut elements: Vec<DetectedElement> = (1..=8)
+            .map(|i| DetectedElement {
+                id: i,
+                label: (i * 12).to_string(),
+                source: "ocr".to_string(),
+                bbox_norm: [(i as i32) * 50, 899, (i as i32) * 50 + 10, 908],
+                center_norm: [(i as i32) * 50 + 5, 903],
+            })
+            .collect();
+        elements.push(DetectedElement {
+            id: 99,
+            label: "Add".to_string(),
+            source: "ocr".to_string(),
+            bbox_norm: [168, 59, 182, 68],
+            center_norm: [175, 63],
+        });
+
+        filter_ruler_tick_rows(&mut elements);
+        assert_eq!(elements.len(), 1);
+        assert_eq!(elements[0].label, "Add");
     }
 }

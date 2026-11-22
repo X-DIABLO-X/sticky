@@ -45,7 +45,8 @@ impl ModelRouter {
         let mut errors = Vec::new();
         for (provider, model) in execution_chain {
             eprintln!(
-                "[ModelRouter] Attempting provider={} model={}",
+                "[ModelRouter] Attempting task={:?} provider={} model={}",
+                task,
                 provider.provider_name(),
                 model
             );
@@ -53,9 +54,10 @@ impl ModelRouter {
                 Ok(rx) => return Ok(rx),
                 Err(err) => {
                     eprintln!(
-                        "[ModelRouter] Provider {} ({}) failed: {}",
+                        "[ModelRouter] Provider {} ({}) failed for task={:?}: {}",
                         provider.provider_name(),
                         model,
+                        task,
                         err
                     );
                     errors.push(format!("{}({}): {}", provider.provider_name(), model, err));
@@ -69,7 +71,12 @@ impl ModelRouter {
         )))
     }
 
-    async fn resolve_local_model(&self, local: &LocalLlamaProvider, configured: Option<&str>) -> Option<String> {
+    async fn resolve_local_model(
+        &self,
+        local: &LocalLlamaProvider,
+        configured: Option<&str>,
+        task: TaskType,
+    ) -> Option<String> {
         if !local.check_health().await {
             return None;
         }
@@ -80,6 +87,24 @@ impl ModelRouter {
         if let Some(wanted) = configured.filter(|s| !s.trim().is_empty()) {
             if installed.iter().any(|m| m == wanted || m.starts_with(wanted)) {
                 return Some(wanted.to_string());
+            }
+        }
+        if matches!(task, TaskType::ScreenVision | TaskType::GuiDriving) {
+            if let Some(vision_model) = installed.iter().find(|m| {
+                let lower = m.to_ascii_lowercase();
+                lower.contains("vision")
+                    || lower.contains("-vl")
+                    || lower.contains("vl:")
+                    || lower.contains("llava")
+                    || lower.contains("minicpm-v")
+                    || lower.contains("moondream")
+                    || lower.contains("gemma3")
+                    || lower.contains("gemma4")
+                    || lower.contains("bonsai")
+                    || lower.contains("qwen2.5vl")
+                    || lower.contains("qwen3-vl")
+            }) {
+                return Some(vision_model.clone());
             }
         }
         // Auto-pick the first installed Ollama model instead of failing with 404
@@ -114,7 +139,7 @@ impl ModelRouter {
             .map(|k| Arc::new(OpenRouterProvider::new(k.to_string())));
 
         let local_model = self
-            .resolve_local_model(&local, cfg.local_model_name.as_deref())
+            .resolve_local_model(&local, cfg.local_model_name.as_deref(), task)
             .await;
 
         match task {
